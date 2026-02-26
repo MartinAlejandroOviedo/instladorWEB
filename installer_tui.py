@@ -52,6 +52,9 @@ class InstallProfile:
     include_ftp: bool = False
     include_email: bool = False
     include_fail2ban: bool = True
+    setup_domain: bool = False
+    issue_ssl: bool = False
+    primary_domain: str = ""
     hostname: str = ""
     admin_email: str = ""
 
@@ -207,6 +210,15 @@ def profile_packages(profile: InstallProfile) -> List[str]:
     return sorted(set(packages))
 
 
+def is_valid_domain(domain: str) -> bool:
+    return bool(
+        re.match(
+            r"^(?=.{1,253}$)(?!-)(?:[a-zA-Z0-9-]{1,63}\.)+[a-zA-Z]{2,63}$",
+            domain,
+        )
+    )
+
+
 def build_plan(profile: InstallProfile) -> List[PlanAction]:
     packages = profile_packages(profile)
     package_str = " ".join(packages)
@@ -245,18 +257,92 @@ def build_plan(profile: InstallProfile) -> List[PlanAction]:
             make_cmd(["bash", "-lc", "a2enmod proxy proxy_http headers rewrite ssl"]),
             critical=False,
         ),
-        PlanAction(
-            "apache-test",
-            "Validar configuracion Apache",
-            make_cmd(["apachectl", "configtest"]),
-        ),
-        PlanAction(
-            "apache-reload",
-            "Recargar Apache",
-            make_cmd(["systemctl", "reload", "apache2"]),
-            critical=False,
-        ),
     ]
+    if profile.setup_domain and profile.primary_domain:
+        domain = profile.primary_domain.lower().strip()
+        webroot = f"/var/www/{domain}/public"
+        vhost_path = f"/etc/apache2/sites-available/{domain}.conf"
+        vhost_conf = (
+            f"cat > {vhost_path} <<'EOF'\n"
+            "<VirtualHost *:80>\n"
+            f"    ServerName {domain}\n"
+            f"    ServerAlias www.{domain}\n"
+            f"    DocumentRoot {webroot}\n"
+            "    <Directory "
+            f"{webroot}"
+            ">\n"
+            "        AllowOverride All\n"
+            "        Require all granted\n"
+            "    </Directory>\n"
+            f"    ErrorLog ${{APACHE_LOG_DIR}}/{domain}_error.log\n"
+            f"    CustomLog ${{APACHE_LOG_DIR}}/{domain}_access.log combined\n"
+            "</VirtualHost>\n"
+            "EOF"
+        )
+        actions.extend(
+            [
+                PlanAction(
+                    "domain-webroot",
+                    f"Crear webroot para {domain}",
+                    make_cmd(["mkdir", "-p", webroot]),
+                    critical=False,
+                ),
+                PlanAction(
+                    "domain-index",
+                    f"Crear index de prueba para {domain}",
+                    make_cmd(
+                        [
+                            "bash",
+                            "-lc",
+                            f"test -f {webroot}/index.html || echo '<h1>{domain} listo</h1>' > {webroot}/index.html",
+                        ]
+                    ),
+                    critical=False,
+                ),
+                PlanAction(
+                    "domain-vhost",
+                    f"Crear vhost Apache para {domain}",
+                    make_cmd(["bash", "-lc", vhost_conf]),
+                ),
+                PlanAction(
+                    "domain-enable-site",
+                    f"Habilitar sitio Apache {domain}",
+                    make_cmd(["bash", "-lc", f"a2ensite {domain}.conf"]),
+                    critical=False,
+                ),
+            ]
+        )
+    actions.extend(
+        [
+            PlanAction(
+                "apache-test",
+                "Validar configuracion Apache",
+                make_cmd(["apachectl", "configtest"]),
+            ),
+            PlanAction(
+                "apache-reload",
+                "Recargar Apache",
+                make_cmd(["systemctl", "reload", "apache2"]),
+                critical=False,
+            ),
+        ]
+    )
+    if profile.issue_ssl and profile.primary_domain and profile.admin_email:
+        domain = profile.primary_domain.lower().strip()
+        actions.append(
+            PlanAction(
+                "certbot-domain",
+                f"Emitir SSL Let's Encrypt para {domain}",
+                make_cmd(
+                    [
+                        "bash",
+                        "-lc",
+                        f"certbot --apache -d {domain} --non-interactive --agree-tos --redirect -m {profile.admin_email}",
+                    ]
+                ),
+                critical=False,
+            )
+        )
     if profile.include_fail2ban:
         actions.append(
             PlanAction(
@@ -369,6 +455,9 @@ class InstallerTUI:
             "FTP (vsftpd)",
             "Email (postfix+dkim)",
             "Fail2ban",
+            "Configurar dominio Apache",
+            "Emitir SSL (certbot)",
+            "Dominio principal",
             "Hostname",
             "Email admin",
         ]
@@ -381,12 +470,27 @@ class InstallerTUI:
             self.profile.include_email = not self.profile.include_email
         elif selected == "Fail2ban":
             self.profile.include_fail2ban = not self.profile.include_fail2ban
+        elif selected == "Configurar dominio Apache":
+            self.profile.setup_domain = not self.profile.setup_domain
+        elif selected == "Emitir SSL (certbot)":
+            self.profile.issue_ssl = not self.profile.issue_ssl
+        elif selected == "Dominio principal":
+            value = self.prompt_text("Dominio principal", self.profile.primary_domain)
+            self.profile.primary_domain = value.lower().strip()
         elif selected == "Hostname":
             self.profile.hostname = self.prompt_text("Hostname", self.profile.hostname)
         elif selected == "Email admin":
             self.profile.admin_email = self.prompt_text("Email admin", self.profile.admin_email)
 
     def validate_profile(self) -> Tuple[bool, str]:
+        if self.profile.primary_domain and not is_valid_domain(self.profile.primary_domain):
+            return False, "Dominio invalido (ej: ropadesanlorenzo.com)."
+        if self.profile.setup_domain and not self.profile.primary_domain:
+            return False, "Define 'Dominio principal' para crear vhost."
+        if self.profile.issue_ssl and not self.profile.setup_domain:
+            return False, "Activa 'Configurar dominio Apache' antes de SSL."
+        if self.profile.issue_ssl and not self.profile.admin_email:
+            return False, "Email admin requerido para certbot."
         if self.profile.admin_email and not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", self.profile.admin_email):
             return False, "Email admin invalido."
         if self.profile.hostname and len(self.profile.hostname) < 3:
@@ -489,6 +593,9 @@ class InstallerTUI:
             ("FTP (vsftpd)", self.profile.include_ftp),
             ("Email (postfix+dkim)", self.profile.include_email),
             ("Fail2ban", self.profile.include_fail2ban),
+            ("Configurar dominio Apache", self.profile.setup_domain),
+            ("Emitir SSL (certbot)", self.profile.issue_ssl),
+            (f"Dominio principal: {self.profile.primary_domain or '-'}", None),
             (f"Hostname: {self.profile.hostname or '-'}", None),
             (f"Email admin: {self.profile.admin_email or '-'}", None),
         ]
@@ -543,6 +650,8 @@ class InstallerTUI:
         footer = "Teclas: r ejecutar ahora | s resumen | q salir"
         if not self.apply_done:
             footer = "Teclas: r ejecutar ahora | b atras"
+        else:
+            footer = "Teclas: s resumen | b plan | q salir"
         self.screen.addnstr(h - 1, 2, footer, w - 4, curses.A_BOLD)
         self.screen.refresh()
 
@@ -653,7 +762,7 @@ class InstallerTUI:
                 elif key == curses.KEY_UP:
                     self.profile_selection = max(0, self.profile_selection - 1)
                 elif key == curses.KEY_DOWN:
-                    self.profile_selection = min(5, self.profile_selection + 1)
+                    self.profile_selection = min(8, self.profile_selection + 1)
                 elif key in (ord(" "), curses.KEY_ENTER, 10, 13):
                     self.set_profile_value()
                 elif key in (ord("c"), ord("C")):
