@@ -15,6 +15,7 @@ from __future__ import annotations
 import curses
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import time
@@ -54,7 +55,10 @@ class InstallProfile:
     include_fail2ban: bool = True
     setup_domain: bool = False
     issue_ssl: bool = False
+    deploy_web: bool = False
     primary_domain: str = ""
+    web_source_path: str = ""
+    web_git_url: str = ""
     hostname: str = ""
     admin_email: str = ""
 
@@ -210,6 +214,8 @@ def profile_packages(profile: InstallProfile) -> List[str]:
         packages.append("fail2ban")
     if profile.issue_ssl:
         packages.append("python3-certbot-apache")
+    if profile.deploy_web and profile.web_git_url.strip():
+        packages.append("git")
     return sorted(set(packages))
 
 
@@ -220,6 +226,10 @@ def is_valid_domain(domain: str) -> bool:
             domain,
         )
     )
+
+
+def is_valid_git_url(url: str) -> bool:
+    return bool(re.match(r"^(https?|git)://\S+$", url))
 
 
 def build_plan(profile: InstallProfile) -> List[PlanAction]:
@@ -264,6 +274,14 @@ def build_plan(profile: InstallProfile) -> List[PlanAction]:
     if profile.setup_domain and profile.primary_domain:
         domain = profile.primary_domain.lower().strip()
         webroot = f"/var/www/{domain}/public"
+        local_source = os.path.abspath(profile.web_source_path.strip()) if profile.web_source_path else ""
+        git_url = profile.web_git_url.strip()
+        git_source = f"/tmp/panelctl-site-{domain}"
+        source_path = git_source if git_url else local_source
+        webroot_q = shlex.quote(webroot)
+        source_q = shlex.quote(source_path) if source_path else ""
+        git_url_q = shlex.quote(git_url) if git_url else "''"
+        git_source_q = shlex.quote(git_source)
         vhost_path = f"/etc/apache2/sites-available/{domain}.conf"
         vhost_conf = (
             f"cat > {vhost_path} <<'EOF'\n"
@@ -315,6 +333,60 @@ def build_plan(profile: InstallProfile) -> List[PlanAction]:
                 ),
             ]
         )
+        if profile.deploy_web and source_path:
+            if git_url:
+                actions.append(
+                    PlanAction(
+                        "domain-git-clone",
+                        f"Clonar web desde {git_url}",
+                        make_cmd(
+                            [
+                                "bash",
+                                "-lc",
+                                f"rm -rf {git_source_q} && git clone --depth 1 {git_url_q} {git_source_q}",
+                            ]
+                        ),
+                    )
+                )
+            actions.append(
+                PlanAction(
+                    "domain-deploy",
+                    f"Desplegar web desde {source_path}",
+                    make_cmd(
+                        [
+                            "bash",
+                            "-lc",
+                            (
+                                f"test -d {source_q} "
+                                f"&& mkdir -p {webroot_q} "
+                                f"&& find {webroot_q} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} + "
+                                f"&& cp -a {source_q}/. {webroot_q}/ "
+                                f"&& test -z {git_url_q} || rm -rf {git_source_q}"
+                            ),
+                        ]
+                    ),
+                )
+            )
+        actions.append(
+            PlanAction(
+                "domain-perms",
+                f"Ajustar permisos webroot {domain}",
+                make_cmd(
+                    [
+                        "bash",
+                        "-lc",
+                        (
+                            f"chown -R www-data:www-data {webroot_q} "
+                            f"&& find {webroot_q} -type d -exec chmod 755 {{}} + "
+                            f"&& find {webroot_q} -type f -exec chmod 644 {{}} +"
+                        ),
+                    ]
+                ),
+                critical=False,
+            )
+        )
+        if profile.deploy_web:
+            actions = [a for a in actions if a.id != "domain-index"]
     actions.extend(
         [
             PlanAction(
@@ -460,7 +532,10 @@ class InstallerTUI:
             "Fail2ban",
             "Configurar dominio Apache",
             "Emitir SSL (certbot)",
+            "Desplegar web desde carpeta",
             "Dominio principal",
+            "Ruta proyecto web",
+            "URL Git web",
             "Hostname",
             "Email admin",
         ]
@@ -477,9 +552,21 @@ class InstallerTUI:
             self.profile.setup_domain = not self.profile.setup_domain
         elif selected == "Emitir SSL (certbot)":
             self.profile.issue_ssl = not self.profile.issue_ssl
+        elif selected == "Desplegar web desde carpeta":
+            self.profile.deploy_web = not self.profile.deploy_web
         elif selected == "Dominio principal":
             value = self.prompt_text("Dominio principal", self.profile.primary_domain)
             self.profile.primary_domain = value.lower().strip()
+        elif selected == "Ruta proyecto web":
+            self.profile.web_source_path = self.prompt_text(
+                "Ruta proyecto web",
+                self.profile.web_source_path,
+            ).strip()
+        elif selected == "URL Git web":
+            self.profile.web_git_url = self.prompt_text(
+                "URL Git web",
+                self.profile.web_git_url,
+            ).strip()
         elif selected == "Hostname":
             self.profile.hostname = self.prompt_text("Hostname", self.profile.hostname)
         elif selected == "Email admin":
@@ -490,6 +577,14 @@ class InstallerTUI:
             return False, "Dominio invalido (ej: ropadesanlorenzo.com)."
         if self.profile.setup_domain and not self.profile.primary_domain:
             return False, "Define 'Dominio principal' para crear vhost."
+        if self.profile.deploy_web and not self.profile.setup_domain:
+            return False, "Activa 'Configurar dominio Apache' para desplegar web."
+        if self.profile.deploy_web and not self.profile.web_source_path and not self.profile.web_git_url:
+            return False, "Define 'Ruta proyecto web' o 'URL Git web'."
+        if self.profile.web_source_path and not os.path.isdir(self.profile.web_source_path):
+            return False, "Ruta proyecto web no existe o no es carpeta."
+        if self.profile.web_git_url and not is_valid_git_url(self.profile.web_git_url):
+            return False, "URL Git web invalida."
         if self.profile.issue_ssl and not self.profile.setup_domain:
             return False, "Activa 'Configurar dominio Apache' antes de SSL."
         if self.profile.issue_ssl and not self.profile.admin_email:
@@ -598,7 +693,10 @@ class InstallerTUI:
             ("Fail2ban", self.profile.include_fail2ban),
             ("Configurar dominio Apache", self.profile.setup_domain),
             ("Emitir SSL (certbot)", self.profile.issue_ssl),
+            ("Desplegar web desde carpeta", self.profile.deploy_web),
             (f"Dominio principal: {self.profile.primary_domain or '-'}", None),
+            (f"Ruta proyecto web: {self.profile.web_source_path or '-'}", None),
+            (f"URL Git web: {self.profile.web_git_url or '-'}", None),
             (f"Hostname: {self.profile.hostname or '-'}", None),
             (f"Email admin: {self.profile.admin_email or '-'}", None),
         ]
@@ -765,7 +863,7 @@ class InstallerTUI:
                 elif key == curses.KEY_UP:
                     self.profile_selection = max(0, self.profile_selection - 1)
                 elif key == curses.KEY_DOWN:
-                    self.profile_selection = min(8, self.profile_selection + 1)
+                    self.profile_selection = min(11, self.profile_selection + 1)
                 elif key in (ord(" "), curses.KEY_ENTER, 10, 13):
                     self.set_profile_value()
                 elif key in (ord("c"), ord("C")):
