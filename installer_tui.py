@@ -56,6 +56,7 @@ class InstallProfile:
     setup_domain: bool = False
     issue_ssl: bool = False
     deploy_web: bool = False
+    run_node_app: bool = False
     primary_domain: str = ""
     web_source_path: str = ""
     web_git_url: str = ""
@@ -93,6 +94,7 @@ BASE_PACKAGES = [
     "apache2",
     "nodejs",
     "npm",
+    "ca-certificates",
     "sqlite3",
     "certbot",
     "ufw",
@@ -216,6 +218,8 @@ def profile_packages(profile: InstallProfile) -> List[str]:
         packages.append("python3-certbot-apache")
     if profile.deploy_web and profile.web_git_url.strip():
         packages.append("git")
+    if profile.run_node_app:
+        packages.append("build-essential")
     return sorted(set(packages))
 
 
@@ -274,6 +278,8 @@ def build_plan(profile: InstallProfile) -> List[PlanAction]:
     if profile.setup_domain and profile.primary_domain:
         domain = profile.primary_domain.lower().strip()
         webroot = f"/var/www/{domain}/public"
+        service_name = f"panelctl-{domain}".replace(".", "-")
+        service_path = f"/etc/systemd/system/{service_name}.service"
         local_source = os.path.abspath(profile.web_source_path.strip()) if profile.web_source_path else ""
         git_url = profile.web_git_url.strip()
         git_source = f"/tmp/panelctl-site-{domain}"
@@ -283,23 +289,47 @@ def build_plan(profile: InstallProfile) -> List[PlanAction]:
         git_url_q = shlex.quote(git_url) if git_url else "''"
         git_source_q = shlex.quote(git_source)
         vhost_path = f"/etc/apache2/sites-available/{domain}.conf"
-        vhost_conf = (
-            f"cat > {vhost_path} <<'EOF'\n"
-            "<VirtualHost *:80>\n"
-            f"    ServerName {domain}\n"
-            f"    ServerAlias www.{domain}\n"
-            f"    DocumentRoot {webroot}\n"
-            "    <Directory "
-            f"{webroot}"
-            ">\n"
-            "        AllowOverride All\n"
-            "        Require all granted\n"
-            "    </Directory>\n"
-            f"    ErrorLog ${{APACHE_LOG_DIR}}/{domain}_error.log\n"
-            f"    CustomLog ${{APACHE_LOG_DIR}}/{domain}_access.log combined\n"
-            "</VirtualHost>\n"
-            "EOF"
-        )
+        if profile.run_node_app:
+            vhost_conf = (
+                f"cat > {vhost_path} <<'EOF'\n"
+                "<VirtualHost *:80>\n"
+                f"    ServerName {domain}\n"
+                f"    ServerAlias www.{domain}\n"
+                "    ProxyPreserveHost On\n"
+                "    ProxyRequests Off\n"
+                "    ProxyPass /.well-known/acme-challenge/ !\n"
+                f"    Alias /.well-known/acme-challenge/ {webroot}/.well-known/acme-challenge/\n"
+                "    <Directory "
+                f"{webroot}/.well-known/acme-challenge/"
+                ">\n"
+                "        AllowOverride None\n"
+                "        Require all granted\n"
+                "    </Directory>\n"
+                "    ProxyPass / http://127.0.0.1:3000/\n"
+                "    ProxyPassReverse / http://127.0.0.1:3000/\n"
+                f"    ErrorLog ${{APACHE_LOG_DIR}}/{domain}_error.log\n"
+                f"    CustomLog ${{APACHE_LOG_DIR}}/{domain}_access.log combined\n"
+                "</VirtualHost>\n"
+                "EOF"
+            )
+        else:
+            vhost_conf = (
+                f"cat > {vhost_path} <<'EOF'\n"
+                "<VirtualHost *:80>\n"
+                f"    ServerName {domain}\n"
+                f"    ServerAlias www.{domain}\n"
+                f"    DocumentRoot {webroot}\n"
+                "    <Directory "
+                f"{webroot}"
+                ">\n"
+                "        AllowOverride All\n"
+                "        Require all granted\n"
+                "    </Directory>\n"
+                f"    ErrorLog ${{APACHE_LOG_DIR}}/{domain}_error.log\n"
+                f"    CustomLog ${{APACHE_LOG_DIR}}/{domain}_access.log combined\n"
+                "</VirtualHost>\n"
+                "EOF"
+            )
         actions.extend(
             [
                 PlanAction(
@@ -333,6 +363,15 @@ def build_plan(profile: InstallProfile) -> List[PlanAction]:
                 ),
             ]
         )
+        if profile.run_node_app:
+            actions.append(
+                PlanAction(
+                    "domain-acme-dir",
+                    f"Crear carpeta challenge ACME para {domain}",
+                    make_cmd(["mkdir", "-p", f"{webroot}/.well-known/acme-challenge"]),
+                    critical=False,
+                )
+            )
         if profile.deploy_web and source_path:
             if git_url:
                 actions.append(
@@ -367,6 +406,85 @@ def build_plan(profile: InstallProfile) -> List[PlanAction]:
                     ),
                 )
             )
+        if profile.run_node_app and profile.deploy_web:
+            actions.extend(
+                [
+                    PlanAction(
+                        "node-install",
+                        f"Instalar dependencias npm en {domain}",
+                        make_cmd(
+                            [
+                                "bash",
+                                "-lc",
+                                f"cd {webroot_q} && npm install",
+                            ]
+                        ),
+                    ),
+                    PlanAction(
+                        "node-build",
+                        f"Compilar assets frontend para {domain}",
+                        make_cmd(
+                            [
+                                "bash",
+                                "-lc",
+                                f"cd {webroot_q} && npm run tw:build",
+                            ]
+                        ),
+                    ),
+                    PlanAction(
+                        "node-prune",
+                        f"Optimizar dependencias npm para {domain}",
+                        make_cmd(
+                            [
+                                "bash",
+                                "-lc",
+                                f"cd {webroot_q} && npm prune --omit=dev",
+                            ]
+                        ),
+                        critical=False,
+                    ),
+                    PlanAction(
+                        "node-service-file",
+                        f"Crear servicio systemd {service_name}",
+                        make_cmd(
+                            [
+                                "bash",
+                                "-lc",
+                                (
+                                    f"cat > {shlex.quote(service_path)} <<'EOF'\n"
+                                    "[Unit]\n"
+                                    f"Description=PanelCtl Node App ({domain})\n"
+                                    "After=network.target\n\n"
+                                    "[Service]\n"
+                                    "Type=simple\n"
+                                    "User=www-data\n"
+                                    "Group=www-data\n"
+                                    f"WorkingDirectory={webroot}\n"
+                                    "Environment=NODE_ENV=production\n"
+                                    "Environment=PORT=3000\n"
+                                    "ExecStart=/usr/bin/npm start\n"
+                                    "Restart=always\n"
+                                    "RestartSec=5\n\n"
+                                    "[Install]\n"
+                                    "WantedBy=multi-user.target\n"
+                                    "EOF"
+                                ),
+                            ]
+                        ),
+                    ),
+                    PlanAction(
+                        "node-service-enable",
+                        f"Habilitar servicio {service_name}",
+                        make_cmd(
+                            [
+                                "bash",
+                                "-lc",
+                                f"systemctl daemon-reload && systemctl enable --now {shlex.quote(service_name)}",
+                            ]
+                        ),
+                    ),
+                ]
+            )
         actions.append(
             PlanAction(
                 "domain-perms",
@@ -375,16 +493,30 @@ def build_plan(profile: InstallProfile) -> List[PlanAction]:
                     [
                         "bash",
                         "-lc",
-                        (
-                            f"chown -R www-data:www-data {webroot_q} "
-                            f"&& find {webroot_q} -type d -exec chmod 755 {{}} + "
-                            f"&& find {webroot_q} -type f -exec chmod 644 {{}} +"
-                        ),
+                        f"chown -R www-data:www-data {webroot_q}",
                     ]
                 ),
                 critical=False,
             )
         )
+        if not profile.run_node_app:
+            actions.append(
+                PlanAction(
+                    "domain-perms-static-modes",
+                    f"Ajustar modos de archivos web estaticos {domain}",
+                    make_cmd(
+                        [
+                            "bash",
+                            "-lc",
+                            (
+                                f"find {webroot_q} -type d -exec chmod 755 {{}} + "
+                                f"&& find {webroot_q} -type f -exec chmod 644 {{}} +"
+                            ),
+                        ]
+                    ),
+                    critical=False,
+                )
+            )
         if profile.deploy_web:
             actions = [a for a in actions if a.id != "domain-index"]
     actions.extend(
@@ -533,6 +665,7 @@ class InstallerTUI:
             "Configurar dominio Apache",
             "Emitir SSL (certbot)",
             "Desplegar web desde carpeta",
+            "Ejecutar app Node (systemd+proxy)",
             "Dominio principal",
             "Ruta proyecto web",
             "URL Git web",
@@ -554,6 +687,8 @@ class InstallerTUI:
             self.profile.issue_ssl = not self.profile.issue_ssl
         elif selected == "Desplegar web desde carpeta":
             self.profile.deploy_web = not self.profile.deploy_web
+        elif selected == "Ejecutar app Node (systemd+proxy)":
+            self.profile.run_node_app = not self.profile.run_node_app
         elif selected == "Dominio principal":
             value = self.prompt_text("Dominio principal", self.profile.primary_domain)
             self.profile.primary_domain = value.lower().strip()
@@ -579,6 +714,10 @@ class InstallerTUI:
             return False, "Define 'Dominio principal' para crear vhost."
         if self.profile.deploy_web and not self.profile.setup_domain:
             return False, "Activa 'Configurar dominio Apache' para desplegar web."
+        if self.profile.run_node_app and not self.profile.setup_domain:
+            return False, "Activa 'Configurar dominio Apache' para modo Node."
+        if self.profile.run_node_app and not self.profile.deploy_web:
+            return False, "Activa 'Desplegar web desde carpeta' para modo Node."
         if self.profile.deploy_web and not self.profile.web_source_path and not self.profile.web_git_url:
             return False, "Define 'Ruta proyecto web' o 'URL Git web'."
         if self.profile.web_source_path and not os.path.isdir(self.profile.web_source_path):
@@ -694,6 +833,7 @@ class InstallerTUI:
             ("Configurar dominio Apache", self.profile.setup_domain),
             ("Emitir SSL (certbot)", self.profile.issue_ssl),
             ("Desplegar web desde carpeta", self.profile.deploy_web),
+            ("Ejecutar app Node (systemd+proxy)", self.profile.run_node_app),
             (f"Dominio principal: {self.profile.primary_domain or '-'}", None),
             (f"Ruta proyecto web: {self.profile.web_source_path or '-'}", None),
             (f"URL Git web: {self.profile.web_git_url or '-'}", None),
@@ -863,7 +1003,7 @@ class InstallerTUI:
                 elif key == curses.KEY_UP:
                     self.profile_selection = max(0, self.profile_selection - 1)
                 elif key == curses.KEY_DOWN:
-                    self.profile_selection = min(11, self.profile_selection + 1)
+                    self.profile_selection = min(12, self.profile_selection + 1)
                 elif key in (ord(" "), curses.KEY_ENTER, 10, 13):
                     self.set_profile_value()
                 elif key in (ord("c"), ord("C")):
