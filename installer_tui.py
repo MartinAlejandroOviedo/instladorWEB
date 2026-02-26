@@ -56,6 +56,7 @@ class InstallProfile:
     setup_domain: bool = False
     issue_ssl: bool = False
     deploy_web: bool = False
+    preserve_db_on_update: bool = True
     run_node_app: bool = False
     primary_domain: str = ""
     web_source_path: str = ""
@@ -288,6 +289,8 @@ def build_plan(profile: InstallProfile) -> List[PlanAction]:
         source_q = shlex.quote(source_path) if source_path else ""
         git_url_q = shlex.quote(git_url) if git_url else "''"
         git_source_q = shlex.quote(git_source)
+        keep_path = f"/tmp/panelctl-keep-{service_name}"
+        keep_q = shlex.quote(keep_path)
         vhost_path = f"/etc/apache2/sites-available/{domain}.conf"
         if profile.run_node_app:
             vhost_conf = (
@@ -373,6 +376,29 @@ def build_plan(profile: InstallProfile) -> List[PlanAction]:
                 )
             )
         if profile.deploy_web and source_path:
+            deploy_cmd = (
+                f"test -d {source_q} "
+                f"&& mkdir -p {webroot_q} "
+                f"&& find {webroot_q} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} + "
+                f"&& cp -a {source_q}/. {webroot_q}/ "
+                f"&& test -z {git_url_q} || rm -rf {git_source_q}"
+            )
+            if profile.preserve_db_on_update:
+                deploy_cmd = (
+                    f"test -d {source_q} "
+                    f"&& mkdir -p {webroot_q} {webroot_q}/data "
+                    f"&& rm -rf {keep_q} "
+                    f"&& if [ -d {webroot_q}/public/uploads ]; then mkdir -p {keep_q}/public && cp -a {webroot_q}/public/uploads {keep_q}/public/uploads; fi "
+                    f"&& find {webroot_q} -mindepth 1 -maxdepth 1 ! -name data -exec rm -rf {{}} + "
+                    f"&& sh -lc 'for item in {source_q}/*; do "
+                    "name=$(basename \"$item\"); "
+                    "[ \"$name\" = \"data\" ] && continue; "
+                    f"cp -a \"$item\" {webroot_q}/; "
+                    "done' "
+                    f"&& if [ -d {keep_q}/public/uploads ]; then mkdir -p {webroot_q}/public && rm -rf {webroot_q}/public/uploads && cp -a {keep_q}/public/uploads {webroot_q}/public/uploads; fi "
+                    f"&& rm -rf {keep_q} "
+                    f"&& test -z {git_url_q} || rm -rf {git_source_q}"
+                )
             if git_url:
                 actions.append(
                     PlanAction(
@@ -395,13 +421,7 @@ def build_plan(profile: InstallProfile) -> List[PlanAction]:
                         [
                             "bash",
                             "-lc",
-                            (
-                                f"test -d {source_q} "
-                                f"&& mkdir -p {webroot_q} "
-                                f"&& find {webroot_q} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} + "
-                                f"&& cp -a {source_q}/. {webroot_q}/ "
-                                f"&& test -z {git_url_q} || rm -rf {git_source_q}"
-                            ),
+                            deploy_cmd,
                         ]
                     ),
                 )
@@ -665,6 +685,7 @@ class InstallerTUI:
             "Configurar dominio Apache",
             "Emitir SSL (certbot)",
             "Desplegar web desde carpeta",
+            "Actualizar sin tocar DB/Uploads",
             "Ejecutar app Node (systemd+proxy)",
             "Dominio principal",
             "Ruta proyecto web",
@@ -687,6 +708,8 @@ class InstallerTUI:
             self.profile.issue_ssl = not self.profile.issue_ssl
         elif selected == "Desplegar web desde carpeta":
             self.profile.deploy_web = not self.profile.deploy_web
+        elif selected == "Actualizar sin tocar DB/Uploads":
+            self.profile.preserve_db_on_update = not self.profile.preserve_db_on_update
         elif selected == "Ejecutar app Node (systemd+proxy)":
             self.profile.run_node_app = not self.profile.run_node_app
         elif selected == "Dominio principal":
@@ -833,6 +856,7 @@ class InstallerTUI:
             ("Configurar dominio Apache", self.profile.setup_domain),
             ("Emitir SSL (certbot)", self.profile.issue_ssl),
             ("Desplegar web desde carpeta", self.profile.deploy_web),
+            ("Actualizar sin tocar DB/Uploads", self.profile.preserve_db_on_update),
             ("Ejecutar app Node (systemd+proxy)", self.profile.run_node_app),
             (f"Dominio principal: {self.profile.primary_domain or '-'}", None),
             (f"Ruta proyecto web: {self.profile.web_source_path or '-'}", None),
@@ -1003,7 +1027,7 @@ class InstallerTUI:
                 elif key == curses.KEY_UP:
                     self.profile_selection = max(0, self.profile_selection - 1)
                 elif key == curses.KEY_DOWN:
-                    self.profile_selection = min(12, self.profile_selection + 1)
+                    self.profile_selection = min(13, self.profile_selection + 1)
                 elif key in (ord(" "), curses.KEY_ENTER, 10, 13):
                     self.set_profile_value()
                 elif key in (ord("c"), ord("C")):
