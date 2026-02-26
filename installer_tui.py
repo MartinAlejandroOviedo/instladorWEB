@@ -662,16 +662,20 @@ class InstallerTUI:
 
     def prompt_text(self, prompt: str, initial: str = "") -> str:
         h, w = self.screen.getmaxyx()
-        y = h - 2
-        self.screen.move(y, 1)
+        y = max(0, h - 1)
+        prefix = f"{prompt}: "
+        max_len = max(1, w - len(prefix) - 1)
+        self.screen.move(y, 0)
         self.screen.clrtoeol()
-        self.screen.addnstr(y, 1, f"{prompt}: {initial}", w - 2)
+        self.screen.addnstr(y, 0, prefix, w - 1, curses.A_BOLD)
+        self.screen.addnstr(y, len(prefix), initial, w - len(prefix) - 1)
+        self.screen.move(y, min(w - 1, len(prefix) + len(initial)))
         curses.echo()
         curses.curs_set(1)
         try:
-            value = self.screen.getstr(y, len(prompt) + 3 + len(initial), w - len(prompt) - 5)
+            value = self.screen.getstr(y, len(prefix), max_len)
             decoded = value.decode("utf-8", errors="ignore").strip()
-            return decoded or initial
+            return decoded
         finally:
             curses.noecho()
             curses.curs_set(0)
