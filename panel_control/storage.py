@@ -46,6 +46,7 @@ class PanelStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     username TEXT NOT NULL UNIQUE,
                     home_dir TEXT NOT NULL,
+                    password_hash TEXT NOT NULL DEFAULT '',
                     enabled INTEGER NOT NULL DEFAULT 1
                 );
 
@@ -57,6 +58,12 @@ class PanelStore:
                 );
                 """
             )
+            self._ensure_columns(conn)
+
+    def _ensure_columns(self, conn: sqlite3.Connection) -> None:
+        ftp_cols = {row["name"] for row in conn.execute("PRAGMA table_info(ftp_accounts)").fetchall()}
+        if "password_hash" not in ftp_cols:
+            conn.execute("ALTER TABLE ftp_accounts ADD COLUMN password_hash TEXT NOT NULL DEFAULT ''")
 
     def list_dns(self) -> List[sqlite3.Row]:
         with self._connect() as conn:
@@ -78,11 +85,11 @@ class PanelStore:
         with self._connect() as conn:
             return conn.execute("SELECT * FROM ftp_accounts ORDER BY username, id").fetchall()
 
-    def add_ftp(self, username: str, home_dir: str) -> None:
+    def add_ftp(self, username: str, home_dir: str, password_hash: str) -> None:
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO ftp_accounts(username, home_dir, enabled) VALUES (?, ?, 1)",
-                (username, home_dir),
+                "INSERT INTO ftp_accounts(username, home_dir, password_hash, enabled) VALUES (?, ?, ?, 1)",
+                (username, home_dir, password_hash),
             )
 
     def delete_ftp(self, item_id: int) -> int:

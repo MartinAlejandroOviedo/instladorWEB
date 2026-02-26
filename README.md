@@ -14,3 +14,8 @@ instalador y mini panel de control TUI para VPS Debian.
 - `panel_control/validators.py`: validaciones.
 - `panel_control/services.py`: preview de comandos de integracion.
 - `panel_control/app.py`: interfaz TUI de administracion.
+
+## Estado operativo actual del panel
+- DNS: CRUD + apply real a BIND (`/etc/bind/panel-zones` + reload).
+- FTP: CRUD + apply real a usuarios del sistema + restart `vsftpd`.
+- Mail: CRUD en base local (pendiente integracion full postfix/dovecot).

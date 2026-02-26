@@ -6,7 +6,14 @@ import curses
 import hashlib
 from typing import List
 
-from .services import dns_apply_preview, ftp_apply_preview, mail_apply_preview
+from .services import (
+    apply_dns,
+    apply_ftp,
+    dns_apply_preview,
+    ftp_apply_preview,
+    hash_password_for_system,
+    mail_apply_preview,
+)
 from .storage import PanelStore
 from .validators import is_valid_domain, is_valid_email, is_valid_hostname_label, is_valid_record_type
 
@@ -19,6 +26,7 @@ class ControlPanelTUI:
         self.state = "menu"
         self.menu_index = 0
         self.message = "Panel cargado."
+        self.apply_logs: List[str] = []
 
     def prompt_text(self, prompt: str, initial: str = "") -> str:
         h, w = self.screen.getmaxyx()
@@ -51,6 +59,7 @@ class ControlPanelTUI:
             f"FTP accounts ({ftp_count})",
             f"Mail accounts ({mail_count})",
             "Apply preview",
+            "Apply real now",
             "Salir",
         ]
         for i, label in enumerate(options):
@@ -104,6 +113,17 @@ class ControlPanelTUI:
         self.screen.addnstr(h - 2, 2, "Teclas: b volver", w - 4, curses.A_BOLD)
         self.screen.refresh()
 
+    def draw_apply_run(self) -> None:
+        self.screen.erase()
+        h, w = self.screen.getmaxyx()
+        self.draw_header("Apply Real", "Resultados de aplicacion operativa")
+        max_rows = h - 6
+        lines = self.apply_logs or ["Sin ejecucion aun."]
+        for i, line in enumerate(lines[-max_rows:]):
+            self.screen.addnstr(4 + i, 2, line, w - 4)
+        self.screen.addnstr(h - 2, 2, "Teclas: r aplicar ahora | b volver", w - 4, curses.A_BOLD)
+        self.screen.refresh()
+
     def add_dns(self) -> None:
         zone = self.prompt_text("Zone (ej: ropadesanlorenzo.com)").lower()
         name = self.prompt_text("Host (@, www, api)")
@@ -134,11 +154,20 @@ class ControlPanelTUI:
     def add_ftp(self) -> None:
         username = self.prompt_text("Usuario FTP")
         home_dir = self.prompt_text("Home dir", f"/var/www/{username}")
+        password = self.prompt_text("Password FTP")
         if len(username) < 3:
             self.message = "Usuario FTP demasiado corto."
             return
-        self.store.add_ftp(username, home_dir)
-        self.message = "Cuenta FTP agregada (registro local)."
+        if len(password) < 8:
+            self.message = "Password FTP minimo 8 caracteres."
+            return
+        try:
+            password_hash = hash_password_for_system(password)
+        except Exception as exc:
+            self.message = f"No se pudo hashear password: {exc}"
+            return
+        self.store.add_ftp(username, home_dir, password_hash)
+        self.message = "Cuenta FTP agregada (lista para aplicar)."
 
     def add_mail(self) -> None:
         address = self.prompt_text("Cuenta mail (user@dominio)").lower()
@@ -185,6 +214,8 @@ class ControlPanelTUI:
                 self.draw_mail()
             elif self.state == "preview":
                 self.draw_apply_preview()
+            elif self.state == "apply_run":
+                self.draw_apply_run()
 
             key = self.screen.getch()
             if key in (3, ord("q"), ord("Q")):
@@ -198,7 +229,7 @@ class ControlPanelTUI:
                 if key == curses.KEY_UP:
                     self.menu_index = max(0, self.menu_index - 1)
                 elif key == curses.KEY_DOWN:
-                    self.menu_index = min(4, self.menu_index + 1)
+                    self.menu_index = min(5, self.menu_index + 1)
                 elif key in (10, 13, curses.KEY_ENTER):
                     if self.menu_index == 0:
                         self.state = "dns"
@@ -208,6 +239,8 @@ class ControlPanelTUI:
                         self.state = "mail"
                     elif self.menu_index == 3:
                         self.state = "preview"
+                    elif self.menu_index == 4:
+                        self.state = "apply_run"
                     else:
                         self.running = False
             elif self.state == "dns":
@@ -243,6 +276,17 @@ class ControlPanelTUI:
             elif self.state == "preview":
                 if key in (ord("b"), ord("B")):
                     self.state = "menu"
+            elif self.state == "apply_run":
+                if key in (ord("b"), ord("B")):
+                    self.state = "menu"
+                elif key in (ord("r"), ord("R")):
+                    dns_result = apply_dns([dict(r) for r in self.store.list_dns()])
+                    ftp_result = apply_ftp([dict(r) for r in self.store.list_ftp()])
+                    self.apply_logs = dns_result.logs + ftp_result.logs
+                    if not dns_result.ok or not ftp_result.ok:
+                        self.message = "Apply finalizo con errores (revisar logs)."
+                    else:
+                        self.message = "Apply completado OK (DNS/FTP)."
 
 
 def run_control_panel() -> None:
