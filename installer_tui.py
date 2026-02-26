@@ -769,6 +769,9 @@ class InstallerTUI:
                     ok, msg = self.validate_profile()
                     if ok:
                         self.actions = build_plan(self.profile)
+                        self.logs = []
+                        self.apply_done = False
+                        self.apply_ok = False
                         self.state = "plan"
                     else:
                         self.message = msg
