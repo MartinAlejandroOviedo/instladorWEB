@@ -78,6 +78,7 @@ DEPENDENCIES: List[Dependency] = [
     Dependency("Apache2", "apache2", "apache2"),
     Dependency("SQLite3", "sqlite3", "sqlite3"),
     Dependency("Certbot", "certbot", "certbot"),
+    Dependency("Certbot Apache plugin", "python3-certbot-apache", required=False),
     Dependency("UFW", "ufw", "ufw"),
     Dependency("FTP (vsftpd)", "vsftpd", "vsftpd", required=False),
     Dependency("SMTP (Postfix)", "postfix", "postfix", required=False),
@@ -207,6 +208,8 @@ def profile_packages(profile: InstallProfile) -> List[str]:
         packages.extend(["postfix", "opendkim", "opendkim-tools"])
     if profile.include_fail2ban:
         packages.append("fail2ban")
+    if profile.issue_ssl:
+        packages.append("python3-certbot-apache")
     return sorted(set(packages))
 
 
