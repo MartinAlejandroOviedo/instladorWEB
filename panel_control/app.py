@@ -41,11 +41,15 @@ class ControlPanelTUI:
         y = h - 2
         self.screen.move(y, 1)
         self.screen.clrtoeol()
-        self.screen.addnstr(y, 1, f"{prompt}: {initial}", w - 2)
+        label = f"{prompt}"
+        hint = f" [{initial}]" if initial else ""
+        self.screen.addnstr(y, 1, f"{label}{hint}: ", w - 2)
         curses.echo()
         curses.curs_set(1)
         try:
-            raw = self.screen.getstr(y, len(prompt) + 3 + len(initial), w - len(prompt) - 5)
+            start_x = min(w - 2, len(label) + len(hint) + 4)
+            max_len = max(1, w - start_x - 2)
+            raw = self.screen.getstr(y, start_x, max_len)
             value = raw.decode("utf-8", errors="ignore").strip()
             return value or initial
         finally:
