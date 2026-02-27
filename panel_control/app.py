@@ -7,12 +7,16 @@ import hashlib
 from typing import List
 
 from .services import (
+    WebUpdateConfig,
     apply_dns,
     apply_ftp,
+    download_web_update,
     dns_apply_preview,
     ftp_apply_preview,
     hash_password_for_system,
     mail_apply_preview,
+    replace_web_update,
+    web_update_preflight,
 )
 from .storage import PanelStore
 from .validators import is_valid_domain, is_valid_email, is_valid_hostname_label, is_valid_record_type
@@ -27,6 +31,10 @@ class ControlPanelTUI:
         self.menu_index = 0
         self.message = "Panel cargado."
         self.apply_logs: List[str] = []
+        self.web_update_logs: List[str] = []
+        self.web_update_config = WebUpdateConfig(repo_url="")
+        self.web_update_downloaded = False
+        self.web_update_commit = ""
 
     def prompt_text(self, prompt: str, initial: str = "") -> str:
         h, w = self.screen.getmaxyx()
@@ -60,18 +68,13 @@ class ControlPanelTUI:
             f"Mail accounts ({mail_count})",
             "Apply preview",
             "Apply real now",
+            "Actualizar web",
             "Salir",
         ]
         for i, label in enumerate(options):
             attr = curses.A_REVERSE if i == self.menu_index else curses.A_NORMAL
             self.screen.addnstr(4 + i, 2, f"{'>' if i == self.menu_index else ' '} {label}", w - 4, attr)
-        self.screen.addnstr(
-            h - 2,
-            2,
-            "Teclas: flechas mover | enter abrir | q salir",
-            w - 4,
-            curses.A_BOLD,
-        )
+        self.screen.addnstr(h - 2, 2, "Teclas: flechas mover | enter abrir | q salir", w - 4, curses.A_BOLD)
         self.screen.addnstr(h - 3, 2, self.message, w - 4, curses.A_DIM)
         self.screen.refresh()
 
@@ -123,6 +126,57 @@ class ControlPanelTUI:
             self.screen.addnstr(4 + i, 2, line, w - 4)
         self.screen.addnstr(h - 2, 2, "Teclas: r aplicar ahora | b volver", w - 4, curses.A_BOLD)
         self.screen.refresh()
+
+    def draw_web_update(self) -> None:
+        self.screen.erase()
+        h, w = self.screen.getmaxyx()
+        self.draw_header("Actualizar web", "Descarga repo Git y despliega sobre el proyecto preservando DB/uploads")
+        lines = [
+            f"Repo: {self.web_update_config.repo_url or '(sin definir)'}",
+            f"Branch: {self.web_update_config.branch}",
+            f"Destino: {self.web_update_config.project_dir}",
+            f"Servicio: {self.web_update_config.service_name or '(sin restart)'}",
+            f"Backups: {self.web_update_config.backup_dir}",
+            f"Temporal: {self.web_update_config.temp_dir}",
+            f"Descargado: {'si' if self.web_update_downloaded else 'no'}",
+            f"Commit: {self.web_update_commit or '-'}",
+            "",
+            "c configurar + preflight",
+            "d descargar repo",
+            "r backup + reemplazar",
+            "b volver",
+            "",
+            "Ultimos logs:",
+        ]
+        max_rows = h - 6
+        log_rows = self.web_update_logs[-max(0, max_rows - len(lines)) :]
+        for i, line in enumerate((lines + log_rows)[:max_rows]):
+            self.screen.addnstr(4 + i, 2, line, w - 4)
+        self.screen.addnstr(h - 2, 2, "Teclas: c configurar | d descargar | r reemplazar | b volver", w - 4, curses.A_BOLD)
+        self.screen.refresh()
+
+    def configure_web_update(self) -> None:
+        repo_url = self.prompt_text("Repo Git", self.web_update_config.repo_url or "https://github.com/usuario/carthtml.git")
+        branch = self.prompt_text("Branch", self.web_update_config.branch or "main")
+        project_dir = self.prompt_text("Destino proyecto", self.web_update_config.project_dir or "/var/www/carthtml")
+        service_name = self.prompt_text("Servicio systemd", self.web_update_config.service_name or "carthtml")
+        backup_dir = self.prompt_text("Directorio backups", self.web_update_config.backup_dir or "/var/backups/carthtml")
+        temp_dir = self.prompt_text("Directorio temporal", self.web_update_config.temp_dir or "/tmp/carthtml-update")
+
+        self.web_update_config = WebUpdateConfig(
+            repo_url=repo_url.strip(),
+            branch=branch.strip() or "main",
+            project_dir=project_dir.strip() or "/var/www/carthtml",
+            service_name=service_name.strip(),
+            backup_dir=backup_dir.strip() or "/var/backups/carthtml",
+            temp_dir=temp_dir.strip() or "/tmp/carthtml-update",
+        )
+        result = web_update_preflight(self.web_update_config)
+        self.web_update_logs = result.logs
+        self.message = "Preflight OK." if result.ok else "Preflight con errores."
+        if not result.ok:
+            self.web_update_downloaded = False
+            self.web_update_commit = ""
 
     def add_dns(self) -> None:
         zone = self.prompt_text("Zone (ej: ropadesanlorenzo.com)").lower()
@@ -216,6 +270,8 @@ class ControlPanelTUI:
                 self.draw_apply_preview()
             elif self.state == "apply_run":
                 self.draw_apply_run()
+            elif self.state == "web_update":
+                self.draw_web_update()
 
             key = self.screen.getch()
             if key in (3, ord("q"), ord("Q")):
@@ -229,7 +285,7 @@ class ControlPanelTUI:
                 if key == curses.KEY_UP:
                     self.menu_index = max(0, self.menu_index - 1)
                 elif key == curses.KEY_DOWN:
-                    self.menu_index = min(5, self.menu_index + 1)
+                    self.menu_index = min(6, self.menu_index + 1)
                 elif key in (10, 13, curses.KEY_ENTER):
                     if self.menu_index == 0:
                         self.state = "dns"
@@ -241,6 +297,8 @@ class ControlPanelTUI:
                         self.state = "preview"
                     elif self.menu_index == 4:
                         self.state = "apply_run"
+                    elif self.menu_index == 5:
+                        self.state = "web_update"
                     else:
                         self.running = False
             elif self.state == "dns":
@@ -287,6 +345,21 @@ class ControlPanelTUI:
                         self.message = "Apply finalizo con errores (revisar logs)."
                     else:
                         self.message = "Apply completado OK (DNS/FTP)."
+            elif self.state == "web_update":
+                if key in (ord("b"), ord("B")):
+                    self.state = "menu"
+                elif key in (ord("c"), ord("C")):
+                    self.configure_web_update()
+                elif key in (ord("d"), ord("D")):
+                    result = download_web_update(self.web_update_config)
+                    self.web_update_logs = result.logs
+                    self.web_update_downloaded = result.downloaded
+                    self.web_update_commit = result.commit
+                    self.message = "Descarga OK." if result.ok else "Descarga con errores."
+                elif key in (ord("r"), ord("R")):
+                    result = replace_web_update(self.web_update_config)
+                    self.web_update_logs = result.logs
+                    self.message = "Reemplazo OK." if result.ok else "Reemplazo con errores."
 
 
 def run_control_panel() -> None:
