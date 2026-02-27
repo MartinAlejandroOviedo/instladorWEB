@@ -436,7 +436,7 @@ def build_plan(profile: InstallProfile) -> List[PlanAction]:
                             [
                                 "bash",
                                 "-lc",
-                                f"cd {webroot_q} && npm install",
+                                f"cd {webroot_q} && npm install --include=dev",
                             ]
                         ),
                     ),
@@ -482,7 +482,7 @@ def build_plan(profile: InstallProfile) -> List[PlanAction]:
                                     f"WorkingDirectory={webroot}\n"
                                     "Environment=NODE_ENV=production\n"
                                     "Environment=PORT=3000\n"
-                                    "ExecStart=/usr/bin/npm start\n"
+                                    "ExecStart=/usr/bin/node server.js\n"
                                     "Restart=always\n"
                                     "RestartSec=5\n\n"
                                     "[Install]\n"
