@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import curses
-import hashlib
 from typing import List
 
 from .core import PanelManager
@@ -12,11 +11,11 @@ from .services import (
     WebUpdateConfig,
     apply_dns,
     apply_ftp,
+    apply_mail,
     apply_optimization,
     dns_apply_preview,
     download_web_update,
     ftp_apply_preview,
-    hash_password_for_system,
     import_bind_zones,
     list_apache_confs,
     list_apache_modules,
@@ -136,15 +135,30 @@ class ControlPanelTUI:
 
     def recover_panel_access(self) -> bool:
         email, whatsapp = self.get_recovery_settings()
+        username = self.manager.get_panel_username("admin")
         if whatsapp:
             masked = self.manager.mask_phone(whatsapp)
             check = self.prompt_text(f"Confirmar WhatsApp ({masked})")
             if not self.manager.recovery_whatsapp_matches(check):
+                self.manager.record_recovery_event(username, "whatsapp", "rejected", "tui", "invalid_whatsapp")
                 self.message = "WhatsApp de recovery invalido."
                 return False
-        username = self.manager.get_panel_username("admin")
+        limit = self.manager.recovery_rate_limit_status(username, "whatsapp")
+        if not bool(limit["allowed"]):
+            self.manager.record_recovery_event(username, "whatsapp", "blocked", "tui", "rate_limit")
+            self.message = "Demasiados intentos de recovery. Espera un rato."
+            return False
         temp_password = self.manager.issue_temporary_password(username)
         result = send_recovery_secret(email, whatsapp, temp_password, label="Clave temporal NicePanel")
+        if not result.ok:
+            self.manager.cancel_temporary_password(username)
+        self.manager.record_recovery_event(
+            username,
+            "whatsapp",
+            "sent" if result.ok else "failed",
+            "tui",
+            self.manager.mask_phone(whatsapp),
+        )
         self.message = result.logs[-1] if result.logs else "Clave temporal enviada."
         if not result.ok:
             return False
@@ -288,13 +302,13 @@ class ControlPanelTUI:
 
     def draw_ftp(self) -> None:
         rows = self.store.list_ftp()
-        lines = [f"[{r['id']:03d}] {r['username']} -> {r['home_dir']}" for r in rows]
-        self.draw_table("FTP Accounts", lines, "Teclas: a agregar | d eliminar | b volver")
+        lines = [f"[{r['id']:03d}] {r['username']}@{r['domain']} -> {r['home_dir']}" for r in rows]
+        self.draw_table("FTP Accounts", lines, "Teclas: a agregar | c editar | d eliminar | b volver")
 
     def draw_mail(self) -> None:
         rows = self.store.list_mail()
         lines = [f"[{r['id']:03d}] {r['address']}" for r in rows]
-        self.draw_table("Mail Accounts", lines, "Teclas: a agregar | d eliminar | b volver")
+        self.draw_table("Mail Accounts", lines, "Teclas: a agregar | c editar | d eliminar | b volver")
 
     def draw_optimization(self) -> None:
         self.screen.erase()
@@ -676,35 +690,102 @@ class ControlPanelTUI:
         self.message = "Record DNS agregado."
 
     def add_ftp(self) -> None:
-        username = self.prompt_text("Usuario FTP")
-        home_dir = self.prompt_text("Home dir", f"/var/www/{username}")
-        password = self.prompt_text("Password FTP", hidden=True)
-        if len(username) < 3:
-            self.message = "Usuario FTP demasiado corto."
-            return
-        if len(password) < 8:
-            self.message = "Password FTP minimo 8 caracteres."
-            return
         try:
-            password_hash = hash_password_for_system(password)
+            domains = [str(row["domain"]) for row in self.store.list_domains()]
+            domain = self.prompt_text("Dominio FTP", domains[0] if len(domains) == 1 else "").lower().strip()
+            username = self.prompt_text("Usuario FTP")
+            home_dir = self.prompt_text("Home dir", f"/var/www/{domain}/{username}" if domain and username else "")
+            password = self.prompt_text("Password FTP", hidden=True)
+            self.manager.create_ftp_account(
+                {
+                    "username": username,
+                    "domain": domain,
+                    "home_dir": home_dir,
+                    "password": password,
+                }
+            )
         except Exception as exc:
-            self.message = f"No se pudo hashear password: {exc}"
+            self.message = f"No se pudo agregar FTP: {exc}"
             return
-        self.store.add_ftp(username, home_dir, password_hash)
         self.message = "Cuenta FTP agregada (lista para aplicar)."
 
     def add_mail(self) -> None:
-        address = self.prompt_text("Cuenta mail (user@dominio)").lower()
-        password = self.prompt_text("Password", hidden=True)
-        if not is_valid_email(address):
-            self.message = "Email invalido."
+        try:
+            domains = [str(row["domain"]) for row in self.store.list_domains()]
+            domain = self.prompt_text("Dominio mail", domains[0] if len(domains) == 1 else "").lower().strip()
+            local_part = self.prompt_text("Usuario mail", "info").strip()
+            password = self.prompt_text("Password", hidden=True)
+            self.manager.create_mail_account(
+                {
+                    "local_part": local_part,
+                    "domain": domain,
+                    "password": password,
+                }
+            )
+        except Exception as exc:
+            self.message = f"No se pudo agregar mail: {exc}"
             return
-        if len(password) < 8:
-            self.message = "Password minimo 8 caracteres."
-            return
-        password_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
-        self.store.add_mail(address, password_hash)
         self.message = "Cuenta mail agregada (registro local)."
+
+    def edit_ftp(self) -> None:
+        raw = self.prompt_text("ID FTP a editar")
+        try:
+            item_id = int(raw)
+        except ValueError:
+            self.message = "ID invalido."
+            return
+        row = self.store.get_ftp(item_id)
+        if not row:
+            self.message = "Cuenta FTP no encontrada."
+            return
+        domain = self.prompt_text("Dominio FTP", str(row["domain"])).lower().strip()
+        username = self.prompt_text("Usuario FTP", str(row["username"])).strip()
+        home_dir = self.prompt_text("Home dir", str(row["home_dir"])).strip()
+        password = self.prompt_text("Nueva password FTP (vaciar para mantener)", hidden=True)
+        try:
+            self.manager.update_ftp_account(
+                item_id,
+                {
+                    "domain": domain,
+                    "username": username,
+                    "home_dir": home_dir,
+                    "password": password,
+                },
+            )
+        except Exception as exc:
+            self.message = f"No se pudo editar FTP: {exc}"
+            return
+        self.message = "Cuenta FTP actualizada."
+
+    def edit_mail(self) -> None:
+        raw = self.prompt_text("ID mail a editar")
+        try:
+            item_id = int(raw)
+        except ValueError:
+            self.message = "ID invalido."
+            return
+        row = self.store.get_mail(item_id)
+        if not row:
+            self.message = "Cuenta mail no encontrada."
+            return
+        address = str(row["address"])
+        local_default, _, domain_default = address.partition("@")
+        local_part = self.prompt_text("Usuario mail", str(row["local_part"] or local_default)).strip()
+        domain = self.prompt_text("Dominio mail", str(row["domain"] or domain_default)).lower().strip()
+        password = self.prompt_text("Nueva password (vaciar para mantener)", hidden=True)
+        try:
+            self.manager.update_mail_account(
+                item_id,
+                {
+                    "local_part": local_part,
+                    "domain": domain,
+                    "password": password,
+                },
+            )
+        except Exception as exc:
+            self.message = f"No se pudo editar mail: {exc}"
+            return
+        self.message = "Cuenta mail actualizada."
 
     def delete_by_id(self, kind: str) -> None:
         raw = self.prompt_text("ID a eliminar")
@@ -891,6 +972,10 @@ class ControlPanelTUI:
                         self.add_ftp()
                     except Exception as exc:
                         self.message = f"Error FTP: {exc}"
+                elif key in (ord("c"), ord("C")):
+                    if not self.require_permission("accounts.write"):
+                        continue
+                    self.edit_ftp()
                 elif key in (ord("d"), ord("D")):
                     if not self.require_permission("accounts.write"):
                         continue
@@ -905,6 +990,10 @@ class ControlPanelTUI:
                         self.add_mail()
                     except Exception as exc:
                         self.message = f"Error Mail: {exc}"
+                elif key in (ord("c"), ord("C")):
+                    if not self.require_permission("accounts.write"):
+                        continue
+                    self.edit_mail()
                 elif key in (ord("d"), ord("D")):
                     if not self.require_permission("accounts.write"):
                         continue
@@ -941,11 +1030,12 @@ class ControlPanelTUI:
                         self.get_dns_config(),
                     )
                     ftp_result = apply_ftp([dict(r) for r in self.store.list_ftp()])
-                    self.apply_logs = dns_result.logs + ftp_result.logs
-                    if not dns_result.ok or not ftp_result.ok:
+                    mail_result = apply_mail([dict(r) for r in self.store.list_mail()])
+                    self.apply_logs = dns_result.logs + ftp_result.logs + mail_result.logs
+                    if not dns_result.ok or not ftp_result.ok or not mail_result.ok:
                         self.message = "Apply finalizo con errores (revisar logs)."
                     else:
-                        self.message = "Apply completado OK (DNS/FTP)."
+                        self.message = "Apply completado OK (DNS/FTP/Mail)."
             elif self.state == "web_update":
                 if key in (ord("b"), ord("B")):
                     self.state = "menu"

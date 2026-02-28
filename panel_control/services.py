@@ -179,6 +179,22 @@ def hash_password_for_system(password: str) -> str:
     return proc.stdout.strip()
 
 
+def hash_password_for_mailbox(password: str) -> str:
+    try:
+        proc = subprocess.run(
+            ["doveadm", "pw", "-s", "SHA512-CRYPT", "-p", password],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return proc.stdout.strip()
+    except FileNotFoundError:
+        pass
+    crypt_hash = hash_password_for_system(password)
+    return f"{{CRYPT}}{crypt_hash}"
+
+
 def _build_named_block(zones: List[str]) -> str:
     lines = ["# BEGIN PANELCTL MANAGED ZONES"]
     for zone in zones:
@@ -849,8 +865,145 @@ def ftp_apply_preview() -> List[str]:
 
 def mail_apply_preview() -> List[str]:
     return [
-        "# pendiente: integrar mailbox real con postfix+dovecot",
+        "crear usuario/grupo virtual vmail si faltan",
+        "mkdir -p /var/mail/vhosts/<dominio>/<usuario>/Maildir/{cur,new,tmp}",
+        "escribir /etc/postfix/vmailbox y /etc/postfix/vmail-domains",
+        "postmap /etc/postfix/vmailbox y /etc/postfix/vmail-domains",
+        "actualizar bloque managed en /etc/postfix/main.cf",
+        "escribir /etc/dovecot/passwd y /etc/dovecot/conf.d/99-nicepanel-mail.conf",
+        "postfix check",
+        "dovecot reload + postfix reload",
     ]
+
+
+def _write_text_file(path: str, content: str) -> tuple[bool, str]:
+    script = (
+        "python3 - <<'PY'\n"
+        "from pathlib import Path\n"
+        f"path=Path({path!r})\n"
+        f"content={content!r}\n"
+        "path.parent.mkdir(parents=True, exist_ok=True)\n"
+        "path.write_text(content, encoding='utf-8')\n"
+        "PY"
+    )
+    rc, _, err = _run(["bash", "-lc", script])
+    return rc == 0, err
+
+
+def _ensure_virtual_mail_user() -> ApplyResult:
+    logs: List[str] = []
+    rc, _, err = _run(["groupadd", "-f", "vmail"])
+    if rc != 0:
+        return ApplyResult(False, [f"[MAIL] no se pudo asegurar grupo vmail: {err}"])
+    logs.append("[MAIL] grupo vmail OK")
+
+    rc, out, err = _run(["id", "-u", "vmail"])
+    if rc != 0:
+        rc, _, err = _run(
+            ["useradd", "-r", "-g", "vmail", "-d", "/var/mail/vhosts", "-s", "/usr/sbin/nologin", "vmail"]
+        )
+        if rc != 0:
+            return ApplyResult(False, [f"[MAIL] no se pudo crear usuario vmail: {err}"])
+        rc, out, err = _run(["id", "-u", "vmail"])
+        if rc != 0:
+            return ApplyResult(False, [f"[MAIL] no se pudo leer uid de vmail: {err or out}"])
+        logs.append("[MAIL] usuario vmail creado")
+    else:
+        logs.append("[MAIL] usuario vmail OK")
+    uid = out.strip()
+    rc, out, err = _run(["id", "-g", "vmail"])
+    if rc != 0:
+        return ApplyResult(False, [f"[MAIL] no se pudo leer gid de vmail: {err or out}"])
+    gid = out.strip()
+    return ApplyResult(True, logs + [uid, gid])
+
+
+def _render_postfix_mail_domains(accounts: List[dict]) -> str:
+    domains = sorted({str(acc.get("domain", "")).strip().lower() for acc in accounts if str(acc.get("domain", "")).strip()})
+    return "".join(f"{domain} OK\n" for domain in domains)
+
+
+def _render_postfix_mailboxes(accounts: List[dict]) -> str:
+    lines = []
+    for acc in sorted(accounts, key=lambda item: (str(item.get("domain", "")), str(item.get("address", "")))):
+        address = str(acc.get("address", "")).strip().lower()
+        domain = str(acc.get("domain", "")).strip().lower()
+        local_part = str(acc.get("local_part", "") or address.split("@", 1)[0]).strip()
+        if not address or not domain or not local_part:
+            continue
+        lines.append(f"{address} {domain}/{local_part}/Maildir/")
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def _render_dovecot_passwd(accounts: List[dict], uid: str, gid: str) -> str:
+    lines = []
+    for acc in sorted(accounts, key=lambda item: (str(item.get("domain", "")), str(item.get("address", "")))):
+        address = str(acc.get("address", "")).strip().lower()
+        domain = str(acc.get("domain", "")).strip().lower()
+        local_part = str(acc.get("local_part", "") or address.split("@", 1)[0]).strip()
+        password_hash = str(acc.get("password_hash", "")).strip()
+        if not address or not domain or not local_part:
+            continue
+        if not password_hash.startswith("{") and not password_hash.startswith("$6$"):
+            raise RuntimeError(f"hash_mail_invalido:{address}")
+        home = f"/var/mail/vhosts/{domain}/{local_part}"
+        lines.append(
+            f"{address}:{password_hash}:{uid}:{gid}::{home}::userdb_mail=maildir:{home}/Maildir"
+        )
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def _render_postfix_main_cf_block(uid: str, gid: str) -> str:
+    lines = [
+        "# BEGIN PANELCTL MANAGED MAIL",
+        "virtual_mailbox_base = /var/mail/vhosts",
+        "virtual_mailbox_domains = hash:/etc/postfix/vmail-domains",
+        "virtual_mailbox_maps = hash:/etc/postfix/vmailbox",
+        "virtual_minimum_uid = 100",
+        f"virtual_uid_maps = static:{uid}",
+        f"virtual_gid_maps = static:{gid}",
+        "virtual_transport = lmtp:unix:private/dovecot-lmtp",
+        "smtpd_sasl_type = dovecot",
+        "smtpd_sasl_path = private/auth",
+        "smtpd_sasl_auth_enable = yes",
+        "smtpd_tls_auth_only = no",
+        "smtpd_recipient_restrictions = permit_mynetworks,permit_sasl_authenticated,reject_unauth_destination",
+        "# END PANELCTL MANAGED MAIL",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _render_dovecot_nicepanel_conf() -> str:
+    return "\n".join(
+        [
+            "# BEGIN PANELCTL MANAGED MAIL",
+            "passdb {",
+            "  driver = passwd-file",
+            "  args = username_format=%u /etc/dovecot/passwd",
+            "}",
+            "userdb {",
+            "  driver = passwd-file",
+            "  args = username_format=%u /etc/dovecot/passwd",
+            "}",
+            "service auth {",
+            "  unix_listener /var/spool/postfix/private/auth {",
+            "    mode = 0660",
+            "    user = postfix",
+            "    group = postfix",
+            "  }",
+            "}",
+            "service lmtp {",
+            "  unix_listener /var/spool/postfix/private/dovecot-lmtp {",
+            "    mode = 0600",
+            "    user = postfix",
+            "    group = postfix",
+            "  }",
+            "}",
+            "mail_location = maildir:/var/mail/vhosts/%d/%n/Maildir",
+            "# END PANELCTL MANAGED MAIL",
+            "",
+        ]
+    )
 
 
 def apply_dns(records: List[dict], domains: List[dict] | List[str] | None = None, config: DNSConfig | None = None) -> ApplyResult:
@@ -970,6 +1123,94 @@ def apply_ftp(accounts: List[dict]) -> ApplyResult:
     if rc != 0:
         return ApplyResult(False, [f"[FTP] no se pudo reiniciar vsftpd: {err}"])
     logs.append("[FTP] vsftpd reiniciado.")
+    return ApplyResult(True, logs)
+
+
+def apply_mail(accounts: List[dict]) -> ApplyResult:
+    logs: List[str] = []
+    if not accounts:
+        return ApplyResult(True, ["[MAIL] sin cuentas para aplicar."])
+
+    vmail_result = _ensure_virtual_mail_user()
+    if not vmail_result.ok:
+        return vmail_result
+    uid, gid = vmail_result.logs[-2], vmail_result.logs[-1]
+    logs.extend(vmail_result.logs[:-2])
+
+    rc, _, err = _run(["mkdir", "-p", "/var/mail/vhosts"])
+    if rc != 0:
+        return ApplyResult(False, [f"[MAIL] no se pudo crear /var/mail/vhosts: {err}"])
+
+    domain_content = _render_postfix_mail_domains(accounts)
+    mailbox_content = _render_postfix_mailboxes(accounts)
+    try:
+        dovecot_passwd = _render_dovecot_passwd(accounts, uid, gid)
+    except RuntimeError as exc:
+        marker, _, address = str(exc).partition(":")
+        if marker == "hash_mail_invalido":
+            return ApplyResult(False, [f"[MAIL] hash invalido para {address}. Edita la cuenta y rota su password."])
+        raise
+
+    files = [
+        ("/etc/postfix/vmail-domains", domain_content),
+        ("/etc/postfix/vmailbox", mailbox_content),
+        ("/etc/dovecot/passwd", dovecot_passwd),
+        ("/etc/dovecot/conf.d/99-nicepanel-mail.conf", _render_dovecot_nicepanel_conf()),
+    ]
+    for path, content in files:
+        ok, err = _write_text_file(path, content)
+        if not ok:
+            return ApplyResult(False, [f"[MAIL] no se pudo escribir {path}: {err}"])
+        logs.append(f"[MAIL] archivo actualizado: {path}")
+
+    for acc in accounts:
+        domain = str(acc.get("domain", "")).strip().lower()
+        local_part = str(acc.get("local_part", "") or str(acc.get("address", "")).split("@", 1)[0]).strip()
+        if not domain or not local_part:
+            continue
+        base = f"/var/mail/vhosts/{domain}/{local_part}/Maildir"
+        for folder in [base, f"{base}/cur", f"{base}/new", f"{base}/tmp"]:
+            rc, _, err = _run(["mkdir", "-p", folder])
+            if rc != 0:
+                return ApplyResult(False, [f"[MAIL] no se pudo crear {folder}: {err}"])
+        rc, _, err = _run(["chown", "-R", "vmail:vmail", f"/var/mail/vhosts/{domain}/{local_part}"])
+        if rc != 0:
+            return ApplyResult(False, [f"[MAIL] no se pudo asignar ownership para {domain}/{local_part}: {err}"])
+
+    for map_path in ["/etc/postfix/vmail-domains", "/etc/postfix/vmailbox"]:
+        rc, _, err = _run(["postmap", map_path])
+        if rc != 0:
+            return ApplyResult(False, [f"[MAIL] postmap fallo para {map_path}: {err}"])
+        logs.append(f"[MAIL] postmap OK: {map_path}")
+
+    ok, err = _upsert_managed_block(
+        "/etc/postfix/main.cf",
+        "# BEGIN PANELCTL MANAGED MAIL",
+        "# END PANELCTL MANAGED MAIL",
+        _render_postfix_main_cf_block(uid, gid),
+    )
+    if not ok:
+        return ApplyResult(False, [f"[MAIL] no se pudo actualizar /etc/postfix/main.cf: {err}"])
+    logs.append("[MAIL] config actualizada: /etc/postfix/main.cf")
+
+    rc, out, err = _run(["postfix", "check"])
+    if rc != 0:
+        return ApplyResult(False, [f"[MAIL] postfix check fallo: {err or out}"])
+    logs.append("[MAIL] postfix check OK")
+
+    rc, out, err = _run(["dovecot", "-n"])
+    if rc != 0:
+        return ApplyResult(False, [f"[MAIL] dovecot config invalida: {err or out}"])
+    logs.append("[MAIL] dovecot config OK")
+
+    for service in ["dovecot", "postfix"]:
+        rc, _, err = _run(["systemctl", "reload", service])
+        if rc != 0:
+            rc, _, err = _run(["systemctl", "restart", service])
+            if rc != 0:
+                return ApplyResult(False, [f"[MAIL] no se pudo recargar {service}: {err}"])
+        logs.append(f"[MAIL] {service} recargado.")
+
     return ApplyResult(True, logs)
 
 

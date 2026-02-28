@@ -76,6 +76,7 @@ class PanelStore:
                 CREATE TABLE IF NOT EXISTS ftp_accounts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     username TEXT NOT NULL UNIQUE,
+                    domain TEXT NOT NULL DEFAULT '',
                     home_dir TEXT NOT NULL,
                     password_hash TEXT NOT NULL DEFAULT '',
                     enabled INTEGER NOT NULL DEFAULT 1
@@ -84,6 +85,8 @@ class PanelStore:
                 CREATE TABLE IF NOT EXISTS mail_accounts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     address TEXT NOT NULL UNIQUE,
+                    local_part TEXT NOT NULL DEFAULT '',
+                    domain TEXT NOT NULL DEFAULT '',
                     password_hash TEXT NOT NULL,
                     enabled INTEGER NOT NULL DEFAULT 1
                 );
@@ -127,8 +130,29 @@ class PanelStore:
             if column not in domain_cols:
                 conn.execute(f"ALTER TABLE domains ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
         ftp_cols = {row["name"] for row in conn.execute("PRAGMA table_info(ftp_accounts)").fetchall()}
+        if "domain" not in ftp_cols:
+            conn.execute("ALTER TABLE ftp_accounts ADD COLUMN domain TEXT NOT NULL DEFAULT ''")
         if "password_hash" not in ftp_cols:
             conn.execute("ALTER TABLE ftp_accounts ADD COLUMN password_hash TEXT NOT NULL DEFAULT ''")
+        mail_cols = {row["name"] for row in conn.execute("PRAGMA table_info(mail_accounts)").fetchall()}
+        if "local_part" not in mail_cols:
+            conn.execute("ALTER TABLE mail_accounts ADD COLUMN local_part TEXT NOT NULL DEFAULT ''")
+        if "domain" not in mail_cols:
+            conn.execute("ALTER TABLE mail_accounts ADD COLUMN domain TEXT NOT NULL DEFAULT ''")
+        conn.execute(
+            """
+            UPDATE mail_accounts
+            SET local_part = substr(address, 1, instr(address, '@') - 1)
+            WHERE local_part = '' AND instr(address, '@') > 1
+            """
+        )
+        conn.execute(
+            """
+            UPDATE mail_accounts
+            SET domain = substr(address, instr(address, '@') + 1)
+            WHERE domain = '' AND instr(address, '@') > 1
+            """
+        )
 
     def list_dns(self) -> List[sqlite3.Row]:
         with self._connect() as conn:
@@ -148,6 +172,8 @@ class PanelStore:
             if not row:
                 return 0
             conn.execute("DELETE FROM dns_records WHERE zone = ?", (row["domain"],))
+            conn.execute("DELETE FROM ftp_accounts WHERE domain = ?", (row["domain"],))
+            conn.execute("DELETE FROM mail_accounts WHERE domain = ?", (row["domain"],))
             cur = conn.execute("DELETE FROM domains WHERE id = ?", (item_id,))
             return cur.rowcount
 
@@ -182,6 +208,15 @@ class PanelStore:
             )
             if current["domain"] != domain:
                 conn.execute("UPDATE dns_records SET zone = ? WHERE zone = ?", (domain, current["domain"]))
+                conn.execute("UPDATE ftp_accounts SET domain = ? WHERE domain = ?", (domain, current["domain"]))
+                conn.execute(
+                    """
+                    UPDATE mail_accounts
+                    SET domain = ?, address = lower(local_part || '@' || ?)
+                    WHERE domain = ?
+                    """,
+                    (domain, domain, current["domain"]),
+                )
             return cur.rowcount
 
     def upsert_domain(
@@ -258,14 +293,47 @@ class PanelStore:
 
     def list_ftp(self) -> List[sqlite3.Row]:
         with self._connect() as conn:
-            return conn.execute("SELECT * FROM ftp_accounts ORDER BY username, id").fetchall()
+            return conn.execute("SELECT * FROM ftp_accounts ORDER BY domain, username, id").fetchall()
 
-    def add_ftp(self, username: str, home_dir: str, password_hash: str) -> None:
+    def get_ftp(self, item_id: int) -> sqlite3.Row | None:
+        with self._connect() as conn:
+            return conn.execute("SELECT * FROM ftp_accounts WHERE id = ?", (item_id,)).fetchone()
+
+    def get_ftp_by_username(self, username: str) -> sqlite3.Row | None:
+        with self._connect() as conn:
+            return conn.execute("SELECT * FROM ftp_accounts WHERE username = ?", (username,)).fetchone()
+
+    def add_ftp(self, username: str, domain: str, home_dir: str, password_hash: str) -> None:
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO ftp_accounts(username, home_dir, password_hash, enabled) VALUES (?, ?, ?, 1)",
-                (username, home_dir, password_hash),
+                """
+                INSERT INTO ftp_accounts(username, domain, home_dir, password_hash, enabled)
+                VALUES (?, ?, ?, ?, 1)
+                """,
+                (username, domain, home_dir, password_hash),
             )
+
+    def update_ftp(self, item_id: int, username: str, domain: str, home_dir: str, password_hash: str | None = None) -> int:
+        with self._connect() as conn:
+            if password_hash:
+                cur = conn.execute(
+                    """
+                    UPDATE ftp_accounts
+                    SET username = ?, domain = ?, home_dir = ?, password_hash = ?
+                    WHERE id = ?
+                    """,
+                    (username, domain, home_dir, password_hash, item_id),
+                )
+            else:
+                cur = conn.execute(
+                    """
+                    UPDATE ftp_accounts
+                    SET username = ?, domain = ?, home_dir = ?
+                    WHERE id = ?
+                    """,
+                    (username, domain, home_dir, item_id),
+                )
+            return cur.rowcount
 
     def delete_ftp(self, item_id: int) -> int:
         with self._connect() as conn:
@@ -274,14 +342,54 @@ class PanelStore:
 
     def list_mail(self) -> List[sqlite3.Row]:
         with self._connect() as conn:
-            return conn.execute("SELECT * FROM mail_accounts ORDER BY address, id").fetchall()
+            return conn.execute("SELECT * FROM mail_accounts ORDER BY domain, local_part, id").fetchall()
 
-    def add_mail(self, address: str, password_hash: str) -> None:
+    def get_mail(self, item_id: int) -> sqlite3.Row | None:
+        with self._connect() as conn:
+            return conn.execute("SELECT * FROM mail_accounts WHERE id = ?", (item_id,)).fetchone()
+
+    def get_mail_by_address(self, address: str) -> sqlite3.Row | None:
+        with self._connect() as conn:
+            return conn.execute("SELECT * FROM mail_accounts WHERE address = ?", (address,)).fetchone()
+
+    def add_mail(self, local_part: str, domain: str, address: str, password_hash: str) -> None:
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO mail_accounts(address, password_hash, enabled) VALUES (?, ?, 1)",
-                (address, password_hash),
+                """
+                INSERT INTO mail_accounts(address, local_part, domain, password_hash, enabled)
+                VALUES (?, ?, ?, ?, 1)
+                """,
+                (address, local_part, domain, password_hash),
             )
+
+    def update_mail(
+        self,
+        item_id: int,
+        local_part: str,
+        domain: str,
+        address: str,
+        password_hash: str | None = None,
+    ) -> int:
+        with self._connect() as conn:
+            if password_hash:
+                cur = conn.execute(
+                    """
+                    UPDATE mail_accounts
+                    SET address = ?, local_part = ?, domain = ?, password_hash = ?
+                    WHERE id = ?
+                    """,
+                    (address, local_part, domain, password_hash, item_id),
+                )
+            else:
+                cur = conn.execute(
+                    """
+                    UPDATE mail_accounts
+                    SET address = ?, local_part = ?, domain = ?
+                    WHERE id = ?
+                    """,
+                    (address, local_part, domain, item_id),
+                )
+            return cur.rowcount
 
     def delete_mail(self, item_id: int) -> int:
         with self._connect() as conn:

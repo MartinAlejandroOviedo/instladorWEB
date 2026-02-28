@@ -17,13 +17,17 @@ from urllib.parse import urlparse
 
 from .core import PanelManager
 from .services import (
+    apply_ftp,
+    apply_mail,
     apply_dns,
     apply_optimization,
     dns_apply_preview,
+    ftp_apply_preview,
     import_bind_zones,
     list_apache_confs,
     list_apache_modules,
     list_apache_sites,
+    mail_apply_preview,
     optimization_preview,
     send_recovery_secret,
     set_apache_conf,
@@ -249,6 +253,16 @@ class PanelAPIHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(HTTPStatus.OK, {"ok": True, "items": [dict(row) for row in self.api.store.list_dns()]})
             return
+        if path == "/api/ftp":
+            if not self._require_permission(auth, "accounts.read"):
+                return
+            self._send_json(HTTPStatus.OK, {"ok": True, "items": self.api.manager.list_ftp_accounts()})
+            return
+        if path == "/api/mail":
+            if not self._require_permission(auth, "accounts.read"):
+                return
+            self._send_json(HTTPStatus.OK, {"ok": True, "items": self.api.manager.list_mail_accounts()})
+            return
         if path == "/api/apache/modules":
             if not self._require_permission(auth, "apache.read"):
                 return
@@ -302,14 +316,33 @@ class PanelAPIHandler(BaseHTTPRequestHandler):
             username = str(payload.get("username", "")).strip()
             whatsapp = str(payload.get("whatsapp", "")).strip()
             if username != self.api.manager.get_panel_username(""):
+                self.api.manager.record_recovery_event(username or "(unknown)", "whatsapp", "rejected", "web", "invalid_username")
                 self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_recovery_request"})
                 return
             if not self.api.manager.recovery_whatsapp_matches(whatsapp):
+                self.api.manager.record_recovery_event(username, "whatsapp", "rejected", "web", "invalid_whatsapp")
                 self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_recovery_request"})
+                return
+            limit = self.api.manager.recovery_rate_limit_status(username, "whatsapp")
+            if not bool(limit["allowed"]):
+                self.api.manager.record_recovery_event(username, "whatsapp", "blocked", "web", "rate_limit")
+                self._send_json(
+                    HTTPStatus.TOO_MANY_REQUESTS,
+                    {"ok": False, "error": "recovery_rate_limited", "remaining": limit["remaining"]},
+                )
                 return
             email, stored_whatsapp = self.api.manager.get_recovery_settings()
             temp_password = self.api.manager.issue_temporary_password(username)
             result = send_recovery_secret(email, stored_whatsapp, temp_password, label="Clave temporal NicePanel")
+            if not result.ok:
+                self.api.manager.cancel_temporary_password(username)
+            self.api.manager.record_recovery_event(
+                username,
+                "whatsapp",
+                "sent" if result.ok else "failed",
+                "web",
+                self.api.manager.mask_phone(stored_whatsapp),
+            )
             status = HTTPStatus.OK if result.ok else HTTPStatus.BAD_REQUEST
             self._send_json(status, {"ok": result.ok, "logs": result.logs, "force_password_change": True})
             return
@@ -352,6 +385,18 @@ class PanelAPIHandler(BaseHTTPRequestHandler):
                 if not self._require_permission(auth, "dns.write"):
                     return
                 item = self.api.manager.create_dns(payload)
+                self._send_json(HTTPStatus.CREATED, {"ok": True, "item": item})
+                return
+            if path == "/api/ftp":
+                if not self._require_permission(auth, "accounts.write"):
+                    return
+                item = self.api.manager.create_ftp_account(payload)
+                self._send_json(HTTPStatus.CREATED, {"ok": True, "item": item})
+                return
+            if path == "/api/mail":
+                if not self._require_permission(auth, "accounts.write"):
+                    return
+                item = self.api.manager.create_mail_account(payload)
                 self._send_json(HTTPStatus.CREATED, {"ok": True, "item": item})
                 return
             if path == "/api/ops/import-bind":
@@ -404,6 +449,16 @@ class PanelAPIHandler(BaseHTTPRequestHandler):
                     return
                 self._send_json(HTTPStatus.OK, {"ok": True, "logs": dns_apply_preview()})
                 return
+            if path == "/api/ops/ftp/preview":
+                if not self._require_permission(auth, "ops.preview"):
+                    return
+                self._send_json(HTTPStatus.OK, {"ok": True, "logs": ftp_apply_preview()})
+                return
+            if path == "/api/ops/mail/preview":
+                if not self._require_permission(auth, "ops.preview"):
+                    return
+                self._send_json(HTTPStatus.OK, {"ok": True, "logs": mail_apply_preview()})
+                return
             if path == "/api/ops/dns/apply":
                 if not self._require_permission(auth, "ops.execute"):
                     return
@@ -412,6 +467,20 @@ class PanelAPIHandler(BaseHTTPRequestHandler):
                     [dict(row) for row in self.api.store.list_domains()],
                     self.api.manager.get_dns_config(),
                 )
+                status = HTTPStatus.OK if result.ok else HTTPStatus.BAD_REQUEST
+                self._send_json(status, {"ok": result.ok, "logs": result.logs})
+                return
+            if path == "/api/ops/ftp/apply":
+                if not self._require_permission(auth, "ops.execute"):
+                    return
+                result = apply_ftp([dict(row) for row in self.api.store.list_ftp()])
+                status = HTTPStatus.OK if result.ok else HTTPStatus.BAD_REQUEST
+                self._send_json(status, {"ok": result.ok, "logs": result.logs})
+                return
+            if path == "/api/ops/mail/apply":
+                if not self._require_permission(auth, "ops.execute"):
+                    return
+                result = apply_mail([dict(row) for row in self.api.store.list_mail()])
                 status = HTTPStatus.OK if result.ok else HTTPStatus.BAD_REQUEST
                 self._send_json(status, {"ok": result.ok, "logs": result.logs})
                 return
@@ -520,6 +589,36 @@ class PanelAPIHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"ok": True, "item": item})
             return
 
+        match, item_id = _split_resource_id(path, "/api/ftp")
+        if match and item_id is not None:
+            if not self._require_permission(auth, "accounts.write"):
+                return
+            try:
+                item = self.api.manager.update_ftp_account(item_id, payload)
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                return
+            except KeyError:
+                self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "ftp_not_found"})
+                return
+            self._send_json(HTTPStatus.OK, {"ok": True, "item": item})
+            return
+
+        match, item_id = _split_resource_id(path, "/api/mail")
+        if match and item_id is not None:
+            if not self._require_permission(auth, "accounts.write"):
+                return
+            try:
+                item = self.api.manager.update_mail_account(item_id, payload)
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                return
+            except KeyError:
+                self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "mail_not_found"})
+                return
+            self._send_json(HTTPStatus.OK, {"ok": True, "item": item})
+            return
+
         if path != "/api/settings":
             self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
             return
@@ -537,6 +636,8 @@ class PanelAPIHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         auth = self._require_auth()
         if auth is None:
+            return
+        if not self._guard_force_password_change(path):
             return
 
         match, item_id = _split_resource_id(path, "/api/domains")
@@ -559,6 +660,30 @@ class PanelAPIHandler(BaseHTTPRequestHandler):
                 self.api.manager.delete_dns(item_id)
             except KeyError:
                 self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "dns_not_found"})
+                return
+            self._send_json(HTTPStatus.OK, {"ok": True})
+            return
+
+        match, item_id = _split_resource_id(path, "/api/ftp")
+        if match and item_id is not None:
+            if not self._require_permission(auth, "accounts.write"):
+                return
+            try:
+                self.api.manager.delete_ftp_account(item_id)
+            except KeyError:
+                self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "ftp_not_found"})
+                return
+            self._send_json(HTTPStatus.OK, {"ok": True})
+            return
+
+        match, item_id = _split_resource_id(path, "/api/mail")
+        if match and item_id is not None:
+            if not self._require_permission(auth, "accounts.write"):
+                return
+            try:
+                self.api.manager.delete_mail_account(item_id)
+            except KeyError:
+                self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "mail_not_found"})
                 return
             self._send_json(HTTPStatus.OK, {"ok": True})
             return

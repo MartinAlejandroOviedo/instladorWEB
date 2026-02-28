@@ -91,6 +91,7 @@ DEPENDENCIES: List[Dependency] = [
     Dependency("UFW", "ufw", "ufw"),
     Dependency("FTP (vsftpd)", "vsftpd", "vsftpd", required=False),
     Dependency("SMTP (Postfix)", "postfix", "postfix", required=False),
+    Dependency("IMAP (Dovecot)", "dovecot-imapd", "dovecot", required=False),
     Dependency("fail2ban", "fail2ban", "fail2ban-server", required=False),
 ]
 
@@ -215,7 +216,7 @@ def profile_packages(profile: InstallProfile) -> List[str]:
     if profile.include_ftp:
         packages.append("vsftpd")
     if profile.include_email:
-        packages.extend(["postfix", "opendkim", "opendkim-tools"])
+        packages.extend(["postfix", "dovecot-core", "dovecot-imapd", "opendkim", "opendkim-tools"])
     if profile.include_fail2ban:
         packages.append("fail2ban")
     if profile.issue_ssl:
@@ -739,15 +740,30 @@ class InstallerTUI:
 
     def recover_panel_access(self) -> bool:
         email, whatsapp = self.auth.get_recovery_settings()
+        username = self.auth.get_panel_username("admin")
         if whatsapp:
             masked = self.auth.mask_phone(whatsapp)
             check = self.prompt_text(f"Confirmar WhatsApp ({masked})")
             if not self.auth.recovery_whatsapp_matches(check):
+                self.auth.record_recovery_event(username, "whatsapp", "rejected", "installer", "invalid_whatsapp")
                 self.message = "WhatsApp de recovery invalido."
                 return False
-        username = self.auth.get_panel_username("admin")
+        limit = self.auth.recovery_rate_limit_status(username, "whatsapp")
+        if not bool(limit["allowed"]):
+            self.auth.record_recovery_event(username, "whatsapp", "blocked", "installer", "rate_limit")
+            self.message = "Demasiados intentos de recovery. Espera un rato."
+            return False
         temp_password = self.auth.issue_temporary_password(username)
         result = send_recovery_secret(email, whatsapp, temp_password, label="Clave temporal NicePanel")
+        if not result.ok:
+            self.auth.cancel_temporary_password(username)
+        self.auth.record_recovery_event(
+            username,
+            "whatsapp",
+            "sent" if result.ok else "failed",
+            "installer",
+            self.auth.mask_phone(whatsapp),
+        )
         self.message = result.logs[-1] if result.logs else "Clave temporal enviada."
         if not result.ok:
             return False
@@ -771,7 +787,7 @@ class InstallerTUI:
         options = [
             "DNS (bind9)",
             "FTP (vsftpd)",
-            "Email (postfix+dkim)",
+            "Email (postfix+dovecot+dkim)",
             "Fail2ban",
             "Configurar dominio Apache",
             "Emitir SSL (certbot)",
@@ -789,7 +805,7 @@ class InstallerTUI:
             self.profile.include_dns = not self.profile.include_dns
         elif selected == "FTP (vsftpd)":
             self.profile.include_ftp = not self.profile.include_ftp
-        elif selected == "Email (postfix+dkim)":
+        elif selected == "Email (postfix+dovecot+dkim)":
             self.profile.include_email = not self.profile.include_email
         elif selected == "Fail2ban":
             self.profile.include_fail2ban = not self.profile.include_fail2ban
@@ -925,10 +941,23 @@ class InstallerTUI:
 
         row = 5 + len(self.preflight)
         self.screen.addnstr(row, 2, "Dependencias detectadas:", w - 4, curses.A_UNDERLINE)
+        installed_count = sum(1 for dep in self.dependencies if dep.installed)
+        required_missing = sum(1 for dep in self.dependencies if dep.dependency.required and not dep.installed)
+        optional_missing = sum(1 for dep in self.dependencies if not dep.dependency.required and not dep.installed)
+        summary = (
+            f"instaladas: {installed_count}/{len(self.dependencies)} | "
+            f"faltantes requeridas: {required_missing} | "
+            f"faltantes opcionales: {optional_missing}"
+        )
+        self.screen.addnstr(row + 1, 4, summary, w - 6, curses.A_DIM)
         for i, dep in enumerate(self.dependencies[: min(len(self.dependencies), h - row - 5)]):
             status = "OK" if dep.installed else "MISSING"
             color = 1 if dep.installed else 2
-            self.screen.addnstr(row + 1 + i, 4, f"[{status:7}] {dep.dependency.package}", w - 6, curses.color_pair(color))
+            kind = "REQ" if dep.dependency.required else "OPT"
+            source = dep.source.upper()
+            detail = dep.detail
+            line = f"[{status:7}] [{kind}] {dep.dependency.package:24} via {source:7} {detail}"
+            self.screen.addnstr(row + 2 + i, 4, line, w - 6, curses.color_pair(color))
 
         if self.message:
             self.screen.addnstr(h - 3, 2, self.message, w - 4, curses.A_DIM)
@@ -947,7 +976,7 @@ class InstallerTUI:
         options = [
             ("DNS (bind9)", self.profile.include_dns),
             ("FTP (vsftpd)", self.profile.include_ftp),
-            ("Email (postfix+dkim)", self.profile.include_email),
+            ("Email (postfix+dovecot+dkim)", self.profile.include_email),
             ("Fail2ban", self.profile.include_fail2ban),
             ("Configurar dominio Apache", self.profile.setup_domain),
             ("Emitir SSL (certbot)", self.profile.issue_ssl),

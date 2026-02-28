@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from typing import Any
+import re
 import secrets
 import time
 
 from .auth import hash_panel_password, is_legacy_sha256_hash, verify_panel_password
 from .crypto import decrypt_string, encrypt_string
-from .services import DNSConfig
+from .services import DNSConfig, hash_password_for_mailbox, hash_password_for_system
 from .storage import PanelStore
 from .validators import (
     is_valid_domain,
@@ -59,6 +60,8 @@ ROLE_PERMISSIONS = {
 
 RECOVERY_RATE_LIMIT = 5
 RECOVERY_RATE_WINDOW_SECONDS = 60 * 60
+ACCOUNT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,31}$")
+MAIL_LOCAL_RE = re.compile(r"^[a-z0-9][a-z0-9._%+-]{0,63}$", re.IGNORECASE)
 
 
 class PanelManager:
@@ -174,6 +177,12 @@ class PanelManager:
         self._set_force_password_change(True)
         self.bump_token_version(username)
         return temp_password
+
+    def cancel_temporary_password(self, username: str) -> None:
+        if username != self.get_panel_username(""):
+            return
+        self._clear_temporary_password()
+        self._set_force_password_change(False)
 
     def get_security_profile(self) -> dict[str, str]:
         recovery_email, recovery_whatsapp = self.get_recovery_settings()
@@ -463,3 +472,157 @@ class PanelManager:
     def delete_dns(self, item_id: int) -> None:
         if not self.store.delete_dns(item_id):
             raise KeyError("dns_not_found")
+
+    def sanitize_ftp_row(self, row: Any) -> dict[str, Any]:
+        return {
+            "id": int(row["id"]),
+            "username": str(row["username"]),
+            "domain": str(row["domain"]),
+            "home_dir": str(row["home_dir"]),
+            "enabled": bool(row["enabled"]),
+        }
+
+    def sanitize_mail_row(self, row: Any) -> dict[str, Any]:
+        return {
+            "id": int(row["id"]),
+            "address": str(row["address"]),
+            "local_part": str(row["local_part"]),
+            "domain": str(row["domain"]),
+            "enabled": bool(row["enabled"]),
+        }
+
+    def list_ftp_accounts(self) -> list[dict[str, Any]]:
+        return [self.sanitize_ftp_row(row) for row in self.store.list_ftp()]
+
+    def list_mail_accounts(self) -> list[dict[str, Any]]:
+        return [self.sanitize_mail_row(row) for row in self.store.list_mail()]
+
+    def _domain_must_exist(self, domain: str) -> None:
+        if not self.store.get_domain_by_name(domain):
+            raise ValueError("domain_not_found")
+
+    def _hash_mail_password(self, password: str) -> str:
+        return hash_password_for_mailbox(password)
+
+    def validate_ftp_payload(self, payload: dict[str, Any], *, require_password: bool) -> dict[str, str]:
+        username = str(payload.get("username", "")).strip().lower()
+        domain = str(payload.get("domain", "")).strip().lower()
+        home_dir = str(payload.get("home_dir", "")).strip()
+        password = str(payload.get("password", ""))
+        if not ACCOUNT_NAME_RE.match(username):
+            raise ValueError("ftp_username_invalido")
+        if not is_valid_domain(domain):
+            raise ValueError("ftp_domain_invalido")
+        self._domain_must_exist(domain)
+        if not home_dir:
+            home_dir = f"/var/www/{domain}/{username}"
+        if require_password and len(password) < 8:
+            raise ValueError("ftp_password_too_short")
+        password_hash = ""
+        if password:
+            password_hash = hash_password_for_system(password)
+        elif require_password:
+            raise ValueError("ftp_password_too_short")
+        return {
+            "username": username,
+            "domain": domain,
+            "home_dir": home_dir,
+            "password_hash": password_hash,
+        }
+
+    def create_ftp_account(self, payload: dict[str, Any]) -> dict[str, Any]:
+        normalized = self.validate_ftp_payload(payload, require_password=True)
+        self.store.add_ftp(
+            normalized["username"],
+            normalized["domain"],
+            normalized["home_dir"],
+            normalized["password_hash"],
+        )
+        row = self.store.get_ftp_by_username(normalized["username"])
+        return self.sanitize_ftp_row(row) if row else normalized
+
+    def update_ftp_account(self, item_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        current = self.store.get_ftp(item_id)
+        if not current:
+            raise KeyError("ftp_not_found")
+        merged = {
+            "username": payload.get("username", current["username"]),
+            "domain": payload.get("domain", current["domain"]),
+            "home_dir": payload.get("home_dir", current["home_dir"]),
+            "password": payload.get("password", ""),
+        }
+        normalized = self.validate_ftp_payload(merged, require_password=False)
+        updated = self.store.update_ftp(
+            item_id,
+            normalized["username"],
+            normalized["domain"],
+            normalized["home_dir"],
+            normalized["password_hash"] or None,
+        )
+        if not updated:
+            raise KeyError("ftp_not_found")
+        row = self.store.get_ftp(item_id)
+        return self.sanitize_ftp_row(row) if row else normalized
+
+    def delete_ftp_account(self, item_id: int) -> None:
+        if not self.store.delete_ftp(item_id):
+            raise KeyError("ftp_not_found")
+
+    def validate_mail_payload(self, payload: dict[str, Any], *, require_password: bool) -> dict[str, str]:
+        local_part = str(payload.get("local_part", "")).strip()
+        domain = str(payload.get("domain", "")).strip().lower()
+        password = str(payload.get("password", ""))
+        if not MAIL_LOCAL_RE.match(local_part):
+            raise ValueError("mail_local_part_invalido")
+        if not is_valid_domain(domain):
+            raise ValueError("mail_domain_invalido")
+        self._domain_must_exist(domain)
+        address = f"{local_part}@{domain}".lower()
+        if not is_valid_email(address):
+            raise ValueError("mail_address_invalida")
+        if require_password and len(password) < 8:
+            raise ValueError("mail_password_too_short")
+        password_hash = self._hash_mail_password(password) if password else ""
+        return {
+            "local_part": local_part,
+            "domain": domain,
+            "address": address,
+            "password_hash": password_hash,
+        }
+
+    def create_mail_account(self, payload: dict[str, Any]) -> dict[str, Any]:
+        normalized = self.validate_mail_payload(payload, require_password=True)
+        self.store.add_mail(
+            normalized["local_part"],
+            normalized["domain"],
+            normalized["address"],
+            normalized["password_hash"],
+        )
+        row = self.store.get_mail_by_address(normalized["address"])
+        return self.sanitize_mail_row(row) if row else normalized
+
+    def update_mail_account(self, item_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        current = self.store.get_mail(item_id)
+        if not current:
+            raise KeyError("mail_not_found")
+        merged = {
+            "local_part": payload.get("local_part", current["local_part"] or current["address"].split("@", 1)[0]),
+            "domain": payload.get("domain", current["domain"] or current["address"].split("@", 1)[-1]),
+            "password": payload.get("password", ""),
+        }
+        normalized = self.validate_mail_payload(merged, require_password=False)
+        updated = self.store.update_mail(
+            item_id,
+            normalized["local_part"],
+            normalized["domain"],
+            normalized["address"],
+            normalized["password_hash"] or None,
+        )
+        if not updated:
+            raise KeyError("mail_not_found")
+        row = self.store.get_mail(item_id)
+        return self.sanitize_mail_row(row) if row else normalized
+
+    def delete_mail_account(self, item_id: int) -> None:
+        if not self.store.delete_mail(item_id):
+            raise KeyError("mail_not_found")

@@ -85,6 +85,14 @@
           <strong id="dns-count">0</strong>
         </article>
         <article class="summary-card">
+          <span class="summary-label">FTP accounts</span>
+          <strong id="ftp-count">0</strong>
+        </article>
+        <article class="summary-card">
+          <span class="summary-label">Mail accounts</span>
+          <strong id="mail-count">0</strong>
+        </article>
+        <article class="summary-card">
           <span class="summary-label">Apache modules</span>
           <strong id="modules-count">0</strong>
         </article>
@@ -93,6 +101,8 @@
       <nav class="tabs">
         <button id="tab-button-domains" class="tab active" data-tab="domains" type="button">Dominios</button>
         <button id="tab-button-dns" class="tab" data-tab="dns" type="button">DNS</button>
+        <button id="tab-button-ftp" class="tab" data-tab="ftp" type="button">FTP</button>
+        <button id="tab-button-mail" class="tab" data-tab="mail" type="button">Mail</button>
         <button id="tab-button-settings" class="tab" data-tab="settings" type="button">Settings</button>
         <button id="tab-button-apache" class="tab" data-tab="apache" type="button">Apache</button>
       </nav>
@@ -183,6 +193,92 @@
                   </tr>
                 </thead>
                 <tbody id="dns-table"></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section id="tab-ftp" class="tab-panel">
+        <div class="panel-grid">
+          <form id="ftp-form" class="card form-card">
+            <div class="card-head">
+              <h2>Cuenta FTP</h2>
+              <button id="ftp-reset" class="button ghost" type="button">Limpiar</button>
+            </div>
+            <input id="ftp-id" type="hidden">
+            <label><span>Usuario</span><input id="ftp-username" required placeholder="cliente01"></label>
+            <label><span>Dominio</span><select id="ftp-domain" required></select></label>
+            <label><span>Home dir</span><input id="ftp-home-dir" placeholder="/var/www/example.com/cliente01"></label>
+            <label><span>Password</span><input id="ftp-password" type="password" placeholder="Dejar vacio para mantener"></label>
+            <div class="form-actions">
+              <button type="submit" class="button primary">Guardar</button>
+            </div>
+          </form>
+
+          <section class="card table-card">
+            <div class="card-head">
+              <h2>Cuentas FTP</h2>
+            </div>
+            <div class="form-actions">
+              <button id="ftp-preview" class="button ghost" type="button">Preview apply</button>
+              <button id="ftp-apply" class="button primary" type="button">Aplicar FTP</button>
+            </div>
+            <pre id="ftp-ops-log" class="ops-log">Sin ejecucion aun.</pre>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>ID</th>
+                    <th>Usuario</th>
+                    <th>Dominio</th>
+                    <th>Home</th>
+                    <th>Acciones</th>
+                  </tr>
+                </thead>
+                <tbody id="ftp-table"></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section id="tab-mail" class="tab-panel">
+        <div class="panel-grid">
+          <form id="mail-form" class="card form-card">
+            <div class="card-head">
+              <h2>Cuenta mail</h2>
+              <button id="mail-reset" class="button ghost" type="button">Limpiar</button>
+            </div>
+            <input id="mail-id" type="hidden">
+            <label><span>Usuario</span><input id="mail-local-part" required placeholder="info"></label>
+            <label><span>Dominio</span><select id="mail-domain" required></select></label>
+            <label><span>Password</span><input id="mail-password" type="password" placeholder="Dejar vacio para mantener"></label>
+            <div class="form-actions">
+              <button type="submit" class="button primary">Guardar</button>
+            </div>
+          </form>
+
+          <section class="card table-card">
+            <div class="card-head">
+              <h2>Cuentas mail</h2>
+            </div>
+            <div class="form-actions">
+              <button id="mail-preview" class="button ghost" type="button">Preview apply</button>
+              <button id="mail-apply" class="button primary" type="button">Aplicar mail</button>
+            </div>
+            <pre id="mail-ops-log" class="ops-log">Sin ejecucion aun.</pre>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>ID</th>
+                    <th>Address</th>
+                    <th>Dominio</th>
+                    <th>Acciones</th>
+                  </tr>
+                </thead>
+                <tbody id="mail-table"></tbody>
               </table>
             </div>
           </section>

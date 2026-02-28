@@ -3,8 +3,12 @@ const state = {
   user: null,
   domains: [],
   dns: [],
+  ftp: [],
+  mail: [],
   modules: [],
   settings: null,
+  ftpOpsLogs: ["Sin ejecucion aun."],
+  mailOpsLogs: ["Sin ejecucion aun."],
 };
 
 const loginView = document.querySelector("#login-view");
@@ -148,6 +152,51 @@ function resetDnsForm() {
   document.querySelector("#dns-ttl").value = 300;
 }
 
+function resetFtpForm() {
+  document.querySelector("#ftp-id").value = "";
+  document.querySelector("#ftp-username").value = "";
+  document.querySelector("#ftp-home-dir").value = "";
+  document.querySelector("#ftp-home-dir").dataset.auto = "1";
+  document.querySelector("#ftp-password").value = "";
+  syncFtpHomeDir();
+}
+
+function resetMailForm() {
+  document.querySelector("#mail-id").value = "";
+  document.querySelector("#mail-local-part").value = "";
+  document.querySelector("#mail-password").value = "";
+}
+
+function renderDomainSelects() {
+  const selects = [document.querySelector("#ftp-domain"), document.querySelector("#mail-domain")];
+  for (const select of selects) {
+    const current = select.value;
+    select.innerHTML = "";
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = state.domains.length ? "Seleccionar dominio" : "Cargar dominio primero";
+    select.appendChild(placeholder);
+    for (const item of state.domains) {
+      const option = document.createElement("option");
+      option.value = item.domain;
+      option.textContent = item.domain;
+      select.appendChild(option);
+    }
+    select.value = state.domains.some((item) => item.domain === current) ? current : "";
+    select.disabled = state.domains.length === 0;
+  }
+}
+
+function syncFtpHomeDir() {
+  const username = document.querySelector("#ftp-username").value.trim();
+  const domain = document.querySelector("#ftp-domain").value.trim();
+  const homeDir = document.querySelector("#ftp-home-dir");
+  if (!homeDir.value.trim() || homeDir.dataset.auto === "1") {
+    homeDir.value = username && domain ? `/var/www/${domain}/${username}` : "";
+    homeDir.dataset.auto = "1";
+  }
+}
+
 function renderDomains() {
   const body = document.querySelector("#domains-table");
   body.innerHTML = "";
@@ -189,6 +238,50 @@ function renderDns() {
   }
 }
 
+function renderFtp() {
+  const body = document.querySelector("#ftp-table");
+  body.innerHTML = "";
+  document.querySelector("#ftp-count").textContent = String(state.ftp.length);
+  for (const item of state.ftp) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${item.id}</td>
+      <td>${item.username}</td>
+      <td>${item.domain}</td>
+      <td>${item.home_dir}</td>
+      <td>
+        <button class="button small ghost" data-action="edit-ftp" data-id="${item.id}" type="button">Editar</button>
+        <button class="button small danger" data-action="delete-ftp" data-id="${item.id}" type="button">Borrar</button>
+      </td>
+    `;
+    body.appendChild(tr);
+  }
+}
+
+function renderMail() {
+  const body = document.querySelector("#mail-table");
+  body.innerHTML = "";
+  document.querySelector("#mail-count").textContent = String(state.mail.length);
+  for (const item of state.mail) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${item.id}</td>
+      <td>${item.address}</td>
+      <td>${item.domain}</td>
+      <td>
+        <button class="button small ghost" data-action="edit-mail" data-id="${item.id}" type="button">Editar</button>
+        <button class="button small danger" data-action="delete-mail" data-id="${item.id}" type="button">Borrar</button>
+      </td>
+    `;
+    body.appendChild(tr);
+  }
+}
+
+function renderOpsLogs() {
+  document.querySelector("#ftp-ops-log").textContent = (state.ftpOpsLogs || ["Sin ejecucion aun."]).join("\n");
+  document.querySelector("#mail-ops-log").textContent = (state.mailOpsLogs || ["Sin ejecucion aun."]).join("\n");
+}
+
 function renderModules() {
   const body = document.querySelector("#modules-table");
   body.innerHTML = "";
@@ -221,26 +314,50 @@ function renderSettings() {
 }
 
 function applyRoleVisibility() {
+  const ftpTab = document.querySelector("#tab-button-ftp");
+  const mailTab = document.querySelector("#tab-button-mail");
   const settingsTab = document.querySelector("#tab-button-settings");
   const apacheTab = document.querySelector("#tab-button-apache");
+  const ftpPanel = document.querySelector("#tab-ftp");
+  const mailPanel = document.querySelector("#tab-mail");
   const settingsPanel = document.querySelector("#tab-settings");
   const apachePanel = document.querySelector("#tab-apache");
   const domainForm = document.querySelector("#domain-form");
   const dnsForm = document.querySelector("#dns-form");
+  const ftpForm = document.querySelector("#ftp-form");
+  const mailForm = document.querySelector("#mail-form");
   const settingsForm = document.querySelector("#settings-form");
+  const ftpPreview = document.querySelector("#ftp-preview");
+  const ftpApply = document.querySelector("#ftp-apply");
+  const mailPreview = document.querySelector("#mail-preview");
+  const mailApply = document.querySelector("#mail-apply");
 
+  ftpTab.hidden = !roleHas("accounts.read");
+  ftpPanel.hidden = !roleHas("accounts.read");
+  mailTab.hidden = !roleHas("accounts.read");
+  mailPanel.hidden = !roleHas("accounts.read");
   settingsTab.hidden = !roleHas("settings.read");
   settingsPanel.hidden = !roleHas("settings.read");
   apacheTab.hidden = !roleHas("apache.read");
   apachePanel.hidden = !roleHas("apache.read");
   domainForm.hidden = !roleHas("domains.write");
   dnsForm.hidden = !roleHas("dns.write");
+  ftpForm.hidden = !roleHas("accounts.write");
+  mailForm.hidden = !roleHas("accounts.write");
+  ftpPreview.hidden = !roleHas("ops.preview");
+  ftpApply.hidden = !roleHas("ops.execute");
+  mailPreview.hidden = !roleHas("ops.preview");
+  mailApply.hidden = !roleHas("ops.execute");
 
   settingsForm.querySelectorAll("input, button").forEach((element) => {
     element.disabled = !roleHas("settings.write");
   });
 
-  if ((!roleHas("settings.read") && settingsTab.classList.contains("active")) || (!roleHas("apache.read") && apacheTab.classList.contains("active"))) {
+  if (
+    (!roleHas("accounts.read") && (ftpTab.classList.contains("active") || mailTab.classList.contains("active"))) ||
+    (!roleHas("settings.read") && settingsTab.classList.contains("active")) ||
+    (!roleHas("apache.read") && apacheTab.classList.contains("active"))
+  ) {
     activateTab("domains");
   }
 }
@@ -253,27 +370,39 @@ async function loadAll() {
   if (state.user?.force_password_change) {
     state.domains = [];
     state.dns = [];
+    state.ftp = [];
+    state.mail = [];
     state.modules = [];
     state.settings = null;
     showForcePassword(true);
     return;
   }
-  const [domains, dns, modules, settings] = await Promise.all([
+  const ftpRequest = roleHas("accounts.read") ? apiFetch("/api/ftp") : Promise.resolve({ items: [] });
+  const mailRequest = roleHas("accounts.read") ? apiFetch("/api/mail") : Promise.resolve({ items: [] });
+  const [domains, dns, ftp, mail, modules, settings] = await Promise.all([
     apiFetch("/api/domains"),
     apiFetch("/api/dns"),
+    ftpRequest,
+    mailRequest,
     apiFetch("/api/apache/modules"),
     apiFetch("/api/settings"),
   ]);
   state.domains = domains.items || [];
   state.dns = dns.items || [];
+  state.ftp = ftp.items || [];
+  state.mail = mail.items || [];
   state.modules = modules.items || [];
   state.settings = settings.settings || null;
   applyRoleVisibility();
   showForcePassword(Boolean(state.user?.force_password_change));
+  renderDomainSelects();
   renderDomains();
   renderDns();
+  renderFtp();
+  renderMail();
   renderModules();
   renderSettings();
+  renderOpsLogs();
 }
 
 async function login(username, password) {
@@ -306,13 +435,19 @@ async function logout(callApi = true) {
   state.user = null;
   state.domains = [];
   state.dns = [];
+  state.ftp = [];
+  state.mail = [];
   state.modules = [];
   state.settings = null;
+  state.ftpOpsLogs = ["Sin ejecucion aun."];
+  state.mailOpsLogs = ["Sin ejecucion aun."];
   sessionUser.textContent = "";
   loginForm.reset();
   showRecoveryForm(false);
   resetDomainForm();
   resetDnsForm();
+  resetFtpForm();
+  resetMailForm();
   showForcePassword(false);
   hideGlobalMessage();
   activateTab("domains");
@@ -381,6 +516,53 @@ document.querySelector("#refresh-all").addEventListener("click", async () => {
 
 document.querySelector("#domain-reset").addEventListener("click", resetDomainForm);
 document.querySelector("#dns-reset").addEventListener("click", resetDnsForm);
+document.querySelector("#ftp-reset").addEventListener("click", resetFtpForm);
+document.querySelector("#mail-reset").addEventListener("click", resetMailForm);
+document.querySelector("#ftp-username").addEventListener("input", syncFtpHomeDir);
+document.querySelector("#ftp-domain").addEventListener("change", syncFtpHomeDir);
+document.querySelector("#ftp-home-dir").addEventListener("input", () => {
+  document.querySelector("#ftp-home-dir").dataset.auto = "0";
+});
+document.querySelector("#ftp-preview").addEventListener("click", async () => {
+  try {
+    const payload = await apiFetch("/api/ops/ftp/preview", { method: "POST", body: "{}" });
+    state.ftpOpsLogs = payload.logs || ["Sin preview."];
+    renderOpsLogs();
+    showGlobalMessage("Preview FTP actualizado.");
+  } catch (error) {
+    showGlobalMessage(error.message, "error");
+  }
+});
+document.querySelector("#ftp-apply").addEventListener("click", async () => {
+  try {
+    const payload = await apiFetch("/api/ops/ftp/apply", { method: "POST", body: "{}" });
+    state.ftpOpsLogs = payload.logs || ["Sin logs."];
+    renderOpsLogs();
+    showGlobalMessage("FTP aplicado.");
+  } catch (error) {
+    showGlobalMessage(error.message, "error");
+  }
+});
+document.querySelector("#mail-preview").addEventListener("click", async () => {
+  try {
+    const payload = await apiFetch("/api/ops/mail/preview", { method: "POST", body: "{}" });
+    state.mailOpsLogs = payload.logs || ["Sin preview."];
+    renderOpsLogs();
+    showGlobalMessage("Preview mail actualizado.");
+  } catch (error) {
+    showGlobalMessage(error.message, "error");
+  }
+});
+document.querySelector("#mail-apply").addEventListener("click", async () => {
+  try {
+    const payload = await apiFetch("/api/ops/mail/apply", { method: "POST", body: "{}" });
+    state.mailOpsLogs = payload.logs || ["Sin logs."];
+    renderOpsLogs();
+    showGlobalMessage("Mail aplicado.");
+  } catch (error) {
+    showGlobalMessage(error.message, "error");
+  }
+});
 
 document.querySelector("#domain-form").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -423,6 +605,49 @@ document.querySelector("#dns-form").addEventListener("submit", async (event) => 
     resetDnsForm();
     await loadAll();
     showGlobalMessage(itemId ? "Record actualizado." : "Record creado.");
+  } catch (error) {
+    showGlobalMessage(error.message, "error");
+  }
+});
+
+document.querySelector("#ftp-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const itemId = document.querySelector("#ftp-id").value;
+  const payload = {
+    username: document.querySelector("#ftp-username").value.trim(),
+    domain: document.querySelector("#ftp-domain").value.trim(),
+    home_dir: document.querySelector("#ftp-home-dir").value.trim(),
+    password: document.querySelector("#ftp-password").value,
+  };
+  try {
+    await apiFetch(itemId ? `/api/ftp/${itemId}` : "/api/ftp", {
+      method: itemId ? "PUT" : "POST",
+      body: JSON.stringify(payload),
+    });
+    resetFtpForm();
+    await loadAll();
+    showGlobalMessage(itemId ? "Cuenta FTP actualizada." : "Cuenta FTP creada.");
+  } catch (error) {
+    showGlobalMessage(error.message, "error");
+  }
+});
+
+document.querySelector("#mail-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const itemId = document.querySelector("#mail-id").value;
+  const payload = {
+    local_part: document.querySelector("#mail-local-part").value.trim(),
+    domain: document.querySelector("#mail-domain").value.trim(),
+    password: document.querySelector("#mail-password").value,
+  };
+  try {
+    await apiFetch(itemId ? `/api/mail/${itemId}` : "/api/mail", {
+      method: itemId ? "PUT" : "POST",
+      body: JSON.stringify(payload),
+    });
+    resetMailForm();
+    await loadAll();
+    showGlobalMessage(itemId ? "Cuenta mail actualizada." : "Cuenta mail creada.");
   } catch (error) {
     showGlobalMessage(error.message, "error");
   }
@@ -535,6 +760,60 @@ document.addEventListener("click", async (event) => {
       await apiFetch(`/api/dns/${itemId}`, { method: "DELETE" });
       await loadAll();
       showGlobalMessage("Record DNS eliminado.");
+    } catch (error) {
+      showGlobalMessage(error.message, "error");
+    }
+    return;
+  }
+  if (action === "edit-ftp") {
+    const item = state.ftp.find((entry) => entry.id === itemId);
+    if (!item) {
+      return;
+    }
+    activateTab("ftp");
+    document.querySelector("#ftp-id").value = String(item.id);
+    document.querySelector("#ftp-username").value = item.username || "";
+    document.querySelector("#ftp-domain").value = item.domain || "";
+    document.querySelector("#ftp-home-dir").value = item.home_dir || "";
+    document.querySelector("#ftp-home-dir").dataset.auto = "0";
+    document.querySelector("#ftp-password").value = "";
+    showGlobalMessage(`Editando FTP ${item.username}@${item.domain}.`);
+    return;
+  }
+  if (action === "delete-ftp") {
+    if (!window.confirm("Borrar esta cuenta FTP?")) {
+      return;
+    }
+    try {
+      await apiFetch(`/api/ftp/${itemId}`, { method: "DELETE" });
+      await loadAll();
+      showGlobalMessage("Cuenta FTP eliminada.");
+    } catch (error) {
+      showGlobalMessage(error.message, "error");
+    }
+    return;
+  }
+  if (action === "edit-mail") {
+    const item = state.mail.find((entry) => entry.id === itemId);
+    if (!item) {
+      return;
+    }
+    activateTab("mail");
+    document.querySelector("#mail-id").value = String(item.id);
+    document.querySelector("#mail-local-part").value = item.local_part || "";
+    document.querySelector("#mail-domain").value = item.domain || "";
+    document.querySelector("#mail-password").value = "";
+    showGlobalMessage(`Editando mail ${item.address}.`);
+    return;
+  }
+  if (action === "delete-mail") {
+    if (!window.confirm("Borrar esta cuenta mail?")) {
+      return;
+    }
+    try {
+      await apiFetch(`/api/mail/${itemId}`, { method: "DELETE" });
+      await loadAll();
+      showGlobalMessage("Cuenta mail eliminada.");
     } catch (error) {
       showGlobalMessage(error.message, "error");
     }
