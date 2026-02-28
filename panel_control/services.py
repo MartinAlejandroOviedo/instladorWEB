@@ -455,12 +455,15 @@ WantedBy=multi-user.target
     ProxyPreserveHost On
     ProxyRequests Off
 
-    <Location {public_path_root}>
+    <Location />
         AuthType Basic
-        AuthName "NicePanel API"
+        AuthName "NicePanel"
         AuthUserFile {auth_path}
         Require valid-user
     </Location>
+
+    ProxyPass / http://{config.api_host}:{config.api_port}/
+    ProxyPassReverse / http://{config.api_host}:{config.api_port}/
 
     ProxyPass {public_path} http://{config.api_host}:{config.api_port}/api/
     ProxyPassReverse {public_path} http://{config.api_host}:{config.api_port}/api/
@@ -501,7 +504,8 @@ WantedBy=multi-user.target
     if rc != 0:
         return OptimizationResult(False, logs + [f"[API] no se pudo recargar apache2: {err}"])
     logs.append("[API] apache2 recargado")
-    logs.append(f"[API] reverse proxy activo en http://{config.server_name}{public_path}")
+    logs.append(f"[API] Web UI activa en http://{config.server_name}/")
+    logs.append(f"[API] API publica activa en http://{config.server_name}{public_path}")
     return OptimizationResult(True, logs)
 
 
