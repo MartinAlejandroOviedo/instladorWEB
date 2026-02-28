@@ -33,6 +33,16 @@ class PanelStore:
         with self._connect() as conn:
             conn.executescript(
                 """
+                CREATE TABLE IF NOT EXISTS domains (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    domain TEXT NOT NULL UNIQUE,
+                    ns1_hostname TEXT NOT NULL DEFAULT '',
+                    ns1_ipv4 TEXT NOT NULL DEFAULT '',
+                    ns2_hostname TEXT NOT NULL DEFAULT '',
+                    ns2_ipv4 TEXT NOT NULL DEFAULT '',
+                    enabled INTEGER NOT NULL DEFAULT 1
+                );
+
                 CREATE TABLE IF NOT EXISTS dns_records (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     zone TEXT NOT NULL,
@@ -56,11 +66,20 @@ class PanelStore:
                     password_hash TEXT NOT NULL,
                     enabled INTEGER NOT NULL DEFAULT 1
                 );
+
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
                 """
             )
             self._ensure_columns(conn)
 
     def _ensure_columns(self, conn: sqlite3.Connection) -> None:
+        domain_cols = {row["name"] for row in conn.execute("PRAGMA table_info(domains)").fetchall()}
+        for column in ["ns1_hostname", "ns1_ipv4", "ns2_hostname", "ns2_ipv4"]:
+            if column not in domain_cols:
+                conn.execute(f"ALTER TABLE domains ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
         ftp_cols = {row["name"] for row in conn.execute("PRAGMA table_info(ftp_accounts)").fetchall()}
         if "password_hash" not in ftp_cols:
             conn.execute("ALTER TABLE ftp_accounts ADD COLUMN password_hash TEXT NOT NULL DEFAULT ''")
@@ -69,12 +88,94 @@ class PanelStore:
         with self._connect() as conn:
             return conn.execute("SELECT * FROM dns_records ORDER BY zone, name, type, id").fetchall()
 
+    def list_domains(self) -> List[sqlite3.Row]:
+        with self._connect() as conn:
+            return conn.execute("SELECT * FROM domains ORDER BY domain, id").fetchall()
+
+    def add_domain(self, domain: str) -> None:
+        with self._connect() as conn:
+            conn.execute("INSERT INTO domains(domain, enabled) VALUES (?, 1)", (domain,))
+
+    def delete_domain(self, item_id: int) -> int:
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM domains WHERE id = ?", (item_id,))
+            return cur.rowcount
+
+    def get_domain(self, item_id: int) -> sqlite3.Row | None:
+        with self._connect() as conn:
+            return conn.execute("SELECT * FROM domains WHERE id = ?", (item_id,)).fetchone()
+
+    def get_domain_by_name(self, domain: str) -> sqlite3.Row | None:
+        with self._connect() as conn:
+            return conn.execute("SELECT * FROM domains WHERE domain = ?", (domain,)).fetchone()
+
+    def update_domain_dns(
+        self,
+        item_id: int,
+        ns1_hostname: str,
+        ns1_ipv4: str,
+        ns2_hostname: str,
+        ns2_ipv4: str,
+    ) -> int:
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE domains
+                SET ns1_hostname = ?, ns1_ipv4 = ?, ns2_hostname = ?, ns2_ipv4 = ?
+                WHERE id = ?
+                """,
+                (ns1_hostname, ns1_ipv4, ns2_hostname, ns2_ipv4, item_id),
+            )
+            return cur.rowcount
+
+    def upsert_domain(
+        self,
+        domain: str,
+        ns1_hostname: str = "",
+        ns1_ipv4: str = "",
+        ns2_hostname: str = "",
+        ns2_ipv4: str = "",
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO domains(domain, ns1_hostname, ns1_ipv4, ns2_hostname, ns2_ipv4, enabled)
+                VALUES (?, ?, ?, ?, ?, 1)
+                ON CONFLICT(domain) DO UPDATE SET
+                    ns1_hostname = excluded.ns1_hostname,
+                    ns1_ipv4 = excluded.ns1_ipv4,
+                    ns2_hostname = excluded.ns2_hostname,
+                    ns2_ipv4 = excluded.ns2_ipv4
+                """,
+                (domain, ns1_hostname, ns1_ipv4, ns2_hostname, ns2_ipv4),
+            )
+
+    def replace_dns_records(self, records: List[tuple[str, str, str, str, int]]) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM dns_records")
+            conn.executemany(
+                "INSERT INTO dns_records(zone, name, type, value, ttl) VALUES (?, ?, ?, ?, ?)",
+                records,
+            )
+
+    def replace_domains(self, domains: List[tuple[str, str, str, str, str]]) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM domains")
+            conn.executemany(
+                """
+                INSERT INTO domains(domain, ns1_hostname, ns1_ipv4, ns2_hostname, ns2_ipv4, enabled)
+                VALUES (?, ?, ?, ?, ?, 1)
+                """,
+                domains,
+            )
+
     def add_dns(self, zone: str, name: str, rtype: str, value: str, ttl: int) -> None:
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO dns_records(zone, name, type, value, ttl) VALUES (?, ?, ?, ?, ?)",
                 (zone, name, rtype, value, ttl),
             )
+            conn.execute("INSERT OR IGNORE INTO domains(domain, enabled) VALUES (?, 1)", (zone,))
 
     def delete_dns(self, item_id: int) -> int:
         with self._connect() as conn:
@@ -119,3 +220,18 @@ class PanelStore:
             ftp_count = conn.execute("SELECT COUNT(*) FROM ftp_accounts").fetchone()[0]
             mail_count = conn.execute("SELECT COUNT(*) FROM mail_accounts").fetchone()[0]
         return dns_count, ftp_count, mail_count
+
+    def get_setting(self, key: str, default: str = "") -> str:
+        with self._connect() as conn:
+            row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+            return str(row["value"]) if row else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO settings(key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (key, value),
+            )

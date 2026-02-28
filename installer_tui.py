@@ -22,6 +22,10 @@ import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+from panel_control.auth import hash_panel_password, is_legacy_sha256_hash, verify_panel_password
+from panel_control.services import send_recovery_code
+from panel_control.storage import PanelStore
+
 
 @dataclass
 class Dependency:
@@ -603,6 +607,7 @@ def build_missing_deps_plan(packages: List[str]) -> List[PlanAction]:
 class InstallerTUI:
     def __init__(self, screen: "curses.window") -> None:
         self.screen = screen
+        self.auth_store = PanelStore()
         self.state = "splash"
         self.running = True
 
@@ -660,7 +665,7 @@ class InstallerTUI:
             if dep.dependency.required and not dep.installed
         ]
 
-    def prompt_text(self, prompt: str, initial: str = "") -> str:
+    def prompt_text(self, prompt: str, initial: str = "", hidden: bool = False) -> str:
         h, w = self.screen.getmaxyx()
         y = max(0, h - 1)
         prefix = f"{prompt}: "
@@ -668,17 +673,98 @@ class InstallerTUI:
         self.screen.move(y, 0)
         self.screen.clrtoeol()
         self.screen.addnstr(y, 0, prefix, w - 1, curses.A_BOLD)
-        self.screen.addnstr(y, len(prefix), initial, w - len(prefix) - 1)
-        self.screen.move(y, min(w - 1, len(prefix) + len(initial)))
-        curses.echo()
+        if not hidden:
+            self.screen.addnstr(y, len(prefix), initial, w - len(prefix) - 1)
+            self.screen.move(y, min(w - 1, len(prefix) + len(initial)))
+            curses.echo()
+        else:
+            curses.noecho()
+            self.screen.move(y, len(prefix))
         curses.curs_set(1)
         try:
             value = self.screen.getstr(y, len(prefix), max_len)
             decoded = value.decode("utf-8", errors="ignore").strip()
-            return decoded
+            return decoded or initial
         finally:
             curses.noecho()
             curses.curs_set(0)
+
+    def panel_password_hash(self, password: str) -> str:
+        return hash_panel_password(password)
+
+    def ensure_panel_login(self) -> bool:
+        username = self.auth_store.get_setting("panel_username")
+        password_hash = self.auth_store.get_setting("panel_password_hash")
+        if username and password_hash:
+            return True
+
+        self.screen.erase()
+        self.draw_header("Configurar acceso", "Primera ejecucion: crea usuario y password del panel")
+        self.screen.refresh()
+        username = self.prompt_text("Usuario admin", "admin").strip()
+        password = self.prompt_text("Password admin", hidden=True)
+        confirm = self.prompt_text("Repetir password", hidden=True)
+        if not username:
+            self.message = "Usuario admin obligatorio."
+            return False
+        if len(password) < 8:
+            self.message = "Password admin minimo 8 caracteres."
+            return False
+        if password != confirm:
+            self.message = "Las passwords no coinciden."
+            return False
+        self.auth_store.set_setting("panel_username", username)
+        self.auth_store.set_setting("panel_password_hash", self.panel_password_hash(password))
+        self.message = "Acceso inicial creado."
+        return True
+
+    def authenticate(self) -> bool:
+        self.screen.erase()
+        self.draw_header("Login instalador", "Usuario RECUPERAR para resetear acceso por email/WhatsApp")
+        self.screen.refresh()
+        username = self.prompt_text("Usuario")
+        if username.lower() == "recuperar":
+            return self.recover_panel_access()
+        password = self.prompt_text("Password", hidden=True)
+        expected_user = self.auth_store.get_setting("panel_username")
+        expected_hash = self.auth_store.get_setting("panel_password_hash")
+        if username == expected_user and verify_panel_password(password, expected_hash):
+            if is_legacy_sha256_hash(expected_hash):
+                self.auth_store.set_setting("panel_password_hash", self.panel_password_hash(password))
+            self.message = f"Sesion iniciada: {username}"
+            return True
+        self.message = "Login invalido."
+        return False
+
+    def recover_panel_access(self) -> bool:
+        email = self.auth_store.get_setting("recovery_email", "")
+        whatsapp = self.auth_store.get_setting("recovery_whatsapp", "")
+        result = send_recovery_code(email, whatsapp)
+        self.message = result.logs[-1] if result.logs else "Recuperacion iniciada."
+        if not result.ok:
+            return False
+
+        code = self.prompt_text("Codigo recibido")
+        if code.strip() != result.code:
+            self.message = "Codigo de recuperacion invalido."
+            return False
+
+        username = self.prompt_text("Nuevo usuario admin", self.auth_store.get_setting("panel_username", "admin")).strip()
+        password = self.prompt_text("Nuevo password admin", hidden=True)
+        confirm = self.prompt_text("Repetir password", hidden=True)
+        if not username:
+            self.message = "Usuario admin obligatorio."
+            return False
+        if len(password) < 8:
+            self.message = "Password admin minimo 8 caracteres."
+            return False
+        if password != confirm:
+            self.message = "Las passwords no coinciden."
+            return False
+        self.auth_store.set_setting("panel_username", username)
+        self.auth_store.set_setting("panel_password_hash", self.panel_password_hash(password))
+        self.message = "Acceso restablecido."
+        return True
 
     def set_profile_value(self) -> None:
         options = [
@@ -986,6 +1072,11 @@ class InstallerTUI:
         curses.init_pair(1, curses.COLOR_GREEN, -1)
         curses.init_pair(2, curses.COLOR_RED, -1)
         curses.init_pair(3, curses.COLOR_YELLOW, -1)
+
+        while self.running and not self.ensure_panel_login():
+            pass
+        while self.running and not self.authenticate():
+            pass
 
         while self.running:
             self.draw()

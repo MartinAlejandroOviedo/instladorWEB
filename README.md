@@ -7,6 +7,9 @@ instalador y mini panel de control TUI para VPS Debian.
 2. Luego administrar datos del panel (DNS/FTP/Mail):
 `python3 panel_control_tui.py`
 
+Ambas TUI ahora piden login. En la primera ejecucion se crea el usuario/password admin y luego se reutiliza para instalacion y configuracion.
+Si se pierde el acceso, se puede escribir `RECUPERAR` en login para intentar reset por email o por un futuro canal WhatsApp.
+
 ## Estructura
 - `installer_tui.py`: instalador inicial del stack.
 - `panel_control/`: mini panel TUI modular.
@@ -16,6 +19,8 @@ instalador y mini panel de control TUI para VPS Debian.
 - `panel_control/app.py`: interfaz TUI de administracion.
 
 ## Estado operativo actual del panel
-- DNS: CRUD + apply real a BIND (`/etc/bind/panel-zones` + reload).
+- DNS: importacion desde BIND actual + dominios con NS por zona + CRUD de records + configuracion base del servidor BIND (`named.conf.options` y `named.conf.local`) + reload.
+- Optimizacion: compresion, cache de estaticos, ajustes seguros, recomendaciones visibles y manejo de modulos/sites/confs Apache desde el panel.
 - FTP: CRUD + apply real a usuarios del sistema + restart `vsftpd`.
 - Mail: CRUD en base local (pendiente integracion full postfix/dovecot).
+- Seguridad: login local para acceder al instalador y al panel de configuracion + recovery email + base lista para recovery por WhatsApp.
