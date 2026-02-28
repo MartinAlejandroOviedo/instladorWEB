@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import base64
 import os
 import re
 import shlex
 import subprocess
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from typing import List
 
@@ -91,6 +95,12 @@ APACHE_COMMON_MODULES = [
     ("proxy_http", "reverse proxy HTTP"),
 ]
 
+WHATSAPP_PROVIDER_ENV = "NICEPANEL_WHATSAPP_PROVIDER"
+TWILIO_ACCOUNT_SID_ENV = "NICEPANEL_TWILIO_ACCOUNT_SID"
+TWILIO_AUTH_TOKEN_ENV = "NICEPANEL_TWILIO_AUTH_TOKEN"
+TWILIO_FROM_ENV = "NICEPANEL_TWILIO_WHATSAPP_FROM"
+TWILIO_CONTENT_SID_ENV = "NICEPANEL_TWILIO_CONTENT_SID"
+
 
 def _run(raw: List[str]) -> tuple[int, str, str]:
     cmd = raw if os.geteuid() == 0 else ["sudo", "-n"] + raw
@@ -101,6 +111,60 @@ def _run(raw: List[str]) -> tuple[int, str, str]:
 def _command_exists(binary: str) -> bool:
     proc = subprocess.run(["bash", "-lc", f"command -v {binary} >/dev/null 2>&1"], check=False)
     return proc.returncode == 0
+
+
+def _normalize_whatsapp_target(phone: str) -> str:
+    digits = "".join(ch for ch in phone if ch.isdigit())
+    return f"whatsapp:+{digits}" if digits else ""
+
+
+def _send_whatsapp_via_twilio(phone: str, body: str) -> tuple[bool, str]:
+    account_sid = os.environ.get(TWILIO_ACCOUNT_SID_ENV, "").strip()
+    auth_token = os.environ.get(TWILIO_AUTH_TOKEN_ENV, "").strip()
+    from_number = os.environ.get(TWILIO_FROM_ENV, "").strip()
+    if not account_sid or not auth_token or not from_number:
+        return False, "Twilio no configurado"
+
+    payload = {
+        "To": _normalize_whatsapp_target(phone),
+        "From": from_number if from_number.startswith("whatsapp:") else f"whatsapp:{from_number}",
+    }
+    content_sid = os.environ.get(TWILIO_CONTENT_SID_ENV, "").strip()
+    if content_sid:
+        payload["ContentSid"] = content_sid
+        payload["ContentVariables"] = json_escape({"1": body})
+    else:
+        payload["Body"] = body
+
+    encoded = urllib.parse.urlencode(payload).encode("utf-8")
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json"
+    request = urllib.request.Request(url, data=encoded, method="POST")
+    auth_bytes = f"{account_sid}:{auth_token}".encode("utf-8")
+    request.add_header("Authorization", "Basic " + base64.b64encode(auth_bytes).decode("ascii"))
+    request.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            if 200 <= response.status < 300:
+                return True, "Twilio WhatsApp enviado"
+            return False, f"Twilio status inesperado: {response.status}"
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore").strip()
+        return False, f"Twilio HTTP {exc.code}: {detail or exc.reason}"
+    except urllib.error.URLError as exc:
+        return False, f"Twilio network error: {exc.reason}"
+
+
+def json_escape(payload: dict[str, str]) -> str:
+    import json
+
+    return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+
+
+def send_whatsapp_message(phone: str, body: str) -> tuple[bool, str]:
+    provider = os.environ.get(WHATSAPP_PROVIDER_ENV, "").strip().lower()
+    if provider == "twilio":
+        return _send_whatsapp_via_twilio(phone, body)
+    return False, "WhatsApp provider no configurado"
 
 
 def hash_password_for_system(password: str) -> str:
@@ -269,12 +333,16 @@ def import_bind_zones() -> DNSImportResult:
 
 
 def send_recovery_code(email: str, whatsapp: str) -> RecoveryResult:
-    logs: List[str] = []
     code = str(int(time.time()))[-6:]
+    return send_recovery_secret(email, whatsapp, code, label="Codigo de recuperacion")
+
+
+def send_recovery_secret(email: str, whatsapp: str, secret: str, label: str = "Codigo de recuperacion") -> RecoveryResult:
+    logs: List[str] = []
     if email.strip():
         if _command_exists("mail"):
             subject = "Recuperacion acceso panel"
-            body = f"Codigo de recuperacion: {code}"
+            body = f"{label}: {secret}"
             cmd = f"printf '%s\n' {shlex.quote(body)} | mail -s {shlex.quote(subject)} {shlex.quote(email)}"
             rc, _, err = _run(["bash", "-lc", cmd])
             if rc == 0:
@@ -284,11 +352,16 @@ def send_recovery_code(email: str, whatsapp: str) -> RecoveryResult:
         else:
             logs.append("[RECOVERY] comando 'mail' no disponible para enviar email")
     if whatsapp.strip():
-        logs.append(f"[RECOVERY] WhatsApp pendiente de integracion API para {whatsapp}")
+        ok, detail = send_whatsapp_message(whatsapp, f"{label}: {secret}")
+        if ok:
+            logs.append(f"[RECOVERY] WhatsApp enviado a {whatsapp}")
+        else:
+            logs.append(f"[RECOVERY] no se pudo enviar WhatsApp a {whatsapp}: {detail}")
     if not email.strip() and not whatsapp.strip():
         logs.append("[RECOVERY] sin email ni WhatsApp configurados")
         return RecoveryResult(False, logs)
-    return RecoveryResult(True, logs, code=code)
+    success = any("enviado" in line for line in logs)
+    return RecoveryResult(success, logs, code=secret)
 
 
 def api_proxy_preview() -> List[str]:

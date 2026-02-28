@@ -25,6 +25,7 @@ from .services import (
     list_apache_modules,
     list_apache_sites,
     optimization_preview,
+    send_recovery_secret,
     set_apache_conf,
     set_apache_module,
     set_apache_site,
@@ -113,10 +114,15 @@ class PanelAPI:
             return None
         return payload
 
-    def authenticate(self, username: str, password: str) -> str | None:
-        if not self.manager.verify_panel_login(username, password):
+    def authenticate(self, username: str, password: str) -> dict[str, Any] | None:
+        auth = self.manager.authenticate_panel(username, password)
+        if not auth.get("ok"):
             return None
-        return self.issue_token(username)
+        return {
+            "token": self.issue_token(username),
+            "user": {"username": username, "role": auth["role"]},
+            "force_password_change": bool(auth.get("force_password_change")),
+        }
 
     def revoke_token(self, payload: dict[str, Any]) -> None:
         self.store.revoke_token(str(payload["jti"]), int(payload["exp"]))
@@ -192,6 +198,13 @@ class PanelAPIHandler(BaseHTTPRequestHandler):
             return None
         return payload
 
+    def _guard_force_password_change(self, path: str) -> bool:
+        allowed = {"/api/me", "/api/change-password", "/api/logout", "/api/logout-all"}
+        if not self.api.manager.get_force_password_change() or path in allowed:
+            return True
+        self._send_json(HTTPStatus.FORBIDDEN, {"ok": False, "error": "password_change_required"})
+        return False
+
     def _require_permission(self, auth: dict[str, Any], permission: str) -> bool:
         role = str(auth.get("r", ""))
         if self.api.manager.has_permission(role, permission):
@@ -210,9 +223,21 @@ class PanelAPIHandler(BaseHTTPRequestHandler):
         auth = self._require_auth()
         if auth is None:
             return
+        if not self._guard_force_password_change(path):
+            return
 
         if path == "/api/me":
-            self._send_json(HTTPStatus.OK, {"ok": True, "user": {"username": auth["u"], "role": auth["r"]}})
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    "user": {
+                        "username": auth["u"],
+                        "role": auth["r"],
+                        "force_password_change": self.api.manager.get_force_password_change(),
+                    },
+                },
+            )
             return
         if path == "/api/domains":
             if not self._require_permission(auth, "domains.read"):
@@ -257,26 +282,66 @@ class PanelAPIHandler(BaseHTTPRequestHandler):
         if path == "/api/login":
             username = str(payload.get("username", "")).strip()
             password = str(payload.get("password", ""))
-            token = self.api.authenticate(username, password)
-            if not token:
+            result = self.api.authenticate(username, password)
+            if not result:
                 self._send_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "invalid_credentials"})
                 return
             self._send_json(
                 HTTPStatus.OK,
                 {
                     "ok": True,
-                    "token": token,
-                    "user": {"username": username, "role": self.api.manager.get_panel_role()},
+                    "token": result["token"],
+                    "user": result["user"],
+                    "force_password_change": result["force_password_change"],
                     "expires_in": TOKEN_TTL_SECONDS,
                 },
             )
             return
 
+        if path == "/api/recover/start":
+            username = str(payload.get("username", "")).strip()
+            whatsapp = str(payload.get("whatsapp", "")).strip()
+            if username != self.api.manager.get_panel_username(""):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_recovery_request"})
+                return
+            if not self.api.manager.recovery_whatsapp_matches(whatsapp):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_recovery_request"})
+                return
+            email, stored_whatsapp = self.api.manager.get_recovery_settings()
+            temp_password = self.api.manager.issue_temporary_password(username)
+            result = send_recovery_secret(email, stored_whatsapp, temp_password, label="Clave temporal NicePanel")
+            status = HTTPStatus.OK if result.ok else HTTPStatus.BAD_REQUEST
+            self._send_json(status, {"ok": result.ok, "logs": result.logs, "force_password_change": True})
+            return
+
         auth = self._require_auth()
         if auth is None:
             return
+        if not self._guard_force_password_change(path):
+            return
 
         try:
+            if path == "/api/change-password":
+                new_password = str(payload.get("new_password", ""))
+                confirm_password = str(payload.get("confirm_password", ""))
+                if len(new_password) < 8:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "password_too_short"})
+                    return
+                if new_password != confirm_password:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "password_mismatch"})
+                    return
+                self.api.manager.set_panel_credentials(str(auth["u"]), new_password, role=str(auth["r"]))
+                token = self.api.issue_token(str(auth["u"]))
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "ok": True,
+                        "token": token,
+                        "user": {"username": auth["u"], "role": auth["r"]},
+                        "force_password_change": False,
+                    },
+                )
+                return
             if path == "/api/domains":
                 if not self._require_permission(auth, "domains.write"):
                     return
@@ -417,6 +482,8 @@ class PanelAPIHandler(BaseHTTPRequestHandler):
         auth = self._require_auth()
         if auth is None:
             return
+        if not self._guard_force_password_change(path):
+            return
         try:
             payload = self._read_json()
         except json.JSONDecodeError:
@@ -425,6 +492,8 @@ class PanelAPIHandler(BaseHTTPRequestHandler):
 
         match, item_id = _split_resource_id(path, "/api/domains")
         if match and item_id is not None:
+            if not self._require_permission(auth, "domains.write"):
+                return
             try:
                 item = self.api.manager.update_domain(item_id, payload)
             except ValueError as exc:
@@ -438,6 +507,8 @@ class PanelAPIHandler(BaseHTTPRequestHandler):
 
         match, item_id = _split_resource_id(path, "/api/dns")
         if match and item_id is not None:
+            if not self._require_permission(auth, "dns.write"):
+                return
             try:
                 item = self.api.manager.update_dns(item_id, payload)
             except ValueError as exc:

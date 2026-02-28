@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 from panel_control.core import PanelManager
-from panel_control.services import send_recovery_code
+from panel_control.services import send_recovery_secret
 
 
 @dataclass
@@ -723,11 +723,15 @@ class InstallerTUI:
         if username.lower() == "recuperar":
             return self.recover_panel_access()
         password = self.prompt_text("Password", hidden=True)
-        if self.auth.verify_panel_login(username, password):
+        auth = self.auth.authenticate_panel(username, password)
+        if auth.get("ok"):
             role = self.auth.get_panel_role()
             if role != "superadmin":
                 self.message = "El instalador requiere rol superadmin."
                 return False
+            if auth.get("force_password_change"):
+                self.message = "Debes cambiar la password temporal."
+                return self.force_password_change(username)
             self.message = f"Sesion iniciada: {username}"
             return True
         self.message = "Login invalido."
@@ -735,30 +739,32 @@ class InstallerTUI:
 
     def recover_panel_access(self) -> bool:
         email, whatsapp = self.auth.get_recovery_settings()
-        result = send_recovery_code(email, whatsapp)
-        self.message = result.logs[-1] if result.logs else "Recuperacion iniciada."
+        if whatsapp:
+            masked = self.auth.mask_phone(whatsapp)
+            check = self.prompt_text(f"Confirmar WhatsApp ({masked})")
+            if not self.auth.recovery_whatsapp_matches(check):
+                self.message = "WhatsApp de recovery invalido."
+                return False
+        username = self.auth.get_panel_username("admin")
+        temp_password = self.auth.issue_temporary_password(username)
+        result = send_recovery_secret(email, whatsapp, temp_password, label="Clave temporal NicePanel")
+        self.message = result.logs[-1] if result.logs else "Clave temporal enviada."
         if not result.ok:
             return False
+        self.message = "Clave temporal enviada. Inicia sesion con ella y cambia tu password."
+        return False
 
-        code = self.prompt_text("Codigo recibido")
-        if code.strip() != result.code:
-            self.message = "Codigo de recuperacion invalido."
-            return False
-
-        username = self.prompt_text("Nuevo usuario admin", self.auth.get_panel_username("admin")).strip()
-        password = self.prompt_text("Nuevo password admin", hidden=True)
+    def force_password_change(self, username: str) -> bool:
+        password = self.prompt_text("Nueva password", hidden=True)
         confirm = self.prompt_text("Repetir password", hidden=True)
-        if not username:
-            self.message = "Usuario admin obligatorio."
-            return False
         if len(password) < 8:
             self.message = "Password admin minimo 8 caracteres."
             return False
         if password != confirm:
             self.message = "Las passwords no coinciden."
             return False
-        self.auth.set_panel_credentials(username, password)
-        self.message = "Acceso restablecido."
+        self.auth.set_panel_credentials(username, password, role=self.auth.get_panel_role())
+        self.message = "Password actualizada. Sesion normalizada."
         return True
 
     def set_profile_value(self) -> None:

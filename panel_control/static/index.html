@@ -28,11 +28,41 @@
           <input id="login-password" name="password" type="password" autocomplete="current-password" required>
         </label>
         <button type="submit" class="button primary">Entrar</button>
+        <button id="show-recovery" type="button" class="button ghost">Recuperar acceso</button>
         <p id="login-error" class="form-error" hidden></p>
+      </form>
+      <form id="recovery-form" class="card form-card" hidden>
+        <label>
+          <span>Usuario</span>
+          <input id="recovery-username" autocomplete="username" required>
+        </label>
+        <label>
+          <span>WhatsApp configurado</span>
+          <input id="recovery-whatsapp" required placeholder="Solo numeros">
+        </label>
+        <div class="form-actions">
+          <button type="submit" class="button primary">Enviar clave temporal</button>
+          <button id="hide-recovery" type="button" class="button ghost">Volver</button>
+        </div>
+        <p id="recovery-message" class="form-error" hidden></p>
       </form>
     </section>
 
     <section id="app-view" hidden>
+      <section id="force-password-view" class="card form-card" hidden>
+        <div class="card-head">
+          <h2>Cambiar password</h2>
+        </div>
+        <p class="lede compact">Ingresaste con una clave temporal. Debes definir una password nueva antes de usar el panel.</p>
+        <form id="force-password-form">
+          <label><span>Nueva password</span><input id="force-password-new" type="password" autocomplete="new-password" required></label>
+          <label><span>Repetir password</span><input id="force-password-confirm" type="password" autocomplete="new-password" required></label>
+          <div class="form-actions">
+            <button type="submit" class="button primary">Guardar password</button>
+          </div>
+          <p id="force-password-message" class="form-error" hidden></p>
+        </form>
+      </section>
       <header class="topbar">
         <div>
           <p class="eyebrow">NicePanel Web UI</p>
@@ -61,10 +91,10 @@
       </section>
 
       <nav class="tabs">
-        <button class="tab active" data-tab="domains" type="button">Dominios</button>
-        <button class="tab" data-tab="dns" type="button">DNS</button>
-        <button class="tab" data-tab="settings" type="button">Settings</button>
-        <button class="tab" data-tab="apache" type="button">Apache</button>
+        <button id="tab-button-domains" class="tab active" data-tab="domains" type="button">Dominios</button>
+        <button id="tab-button-dns" class="tab" data-tab="dns" type="button">DNS</button>
+        <button id="tab-button-settings" class="tab" data-tab="settings" type="button">Settings</button>
+        <button id="tab-button-apache" class="tab" data-tab="apache" type="button">Apache</button>
       </nav>
 
       <p id="global-message" class="global-message" hidden></p>

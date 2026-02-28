@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sqlite3
 from typing import List, Tuple
 
 DEFAULT_DB_PATH = "/var/lib/panelctl/panel.db"
-FALLBACK_DB_PATH = os.path.abspath("panel.db")
+LEGACY_FALLBACK_DB_PATH = os.path.abspath("panel.db")
+FALLBACK_DB_PATH = os.path.expanduser("~/.local/share/nicepanel/.panel.db")
 
 
 class PanelStore:
@@ -17,12 +19,31 @@ class PanelStore:
         else:
             self.db_path = DEFAULT_DB_PATH if os.access(os.path.dirname(DEFAULT_DB_PATH), os.W_OK) else FALLBACK_DB_PATH
         self._ensure_parent_dir()
+        self._maybe_migrate_legacy_fallback()
         self._init_db()
+        self._tighten_permissions()
 
     def _ensure_parent_dir(self) -> None:
         parent = os.path.dirname(self.db_path)
         if parent and not os.path.exists(parent):
             os.makedirs(parent, exist_ok=True)
+
+    def _maybe_migrate_legacy_fallback(self) -> None:
+        if self.db_path != FALLBACK_DB_PATH:
+            return
+        if not os.path.exists(LEGACY_FALLBACK_DB_PATH) or os.path.exists(self.db_path):
+            return
+        try:
+            shutil.move(LEGACY_FALLBACK_DB_PATH, self.db_path)
+        except OSError:
+            return
+
+    def _tighten_permissions(self) -> None:
+        if self.db_path == DEFAULT_DB_PATH or self.db_path == FALLBACK_DB_PATH:
+            try:
+                os.chmod(self.db_path, 0o600)
+            except OSError:
+                pass
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
@@ -85,6 +106,16 @@ class PanelStore:
                 CREATE TABLE IF NOT EXISTS revoked_tokens (
                     jti TEXT PRIMARY KEY,
                     expires_at INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS recovery_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    actor TEXT NOT NULL,
+                    channel TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    requester TEXT NOT NULL DEFAULT '',
+                    detail TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL
                 );
                 """
             )
@@ -328,3 +359,44 @@ class PanelStore:
         with self._connect() as conn:
             cur = conn.execute("DELETE FROM revoked_tokens WHERE expires_at < ?", (now_ts,))
             return cur.rowcount
+
+    def add_recovery_event(
+        self,
+        actor: str,
+        channel: str,
+        status: str,
+        requester: str,
+        detail: str,
+        created_at: int,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO recovery_events(actor, channel, status, requester, detail, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (actor, channel, status, requester, detail, created_at),
+            )
+
+    def count_recent_recovery_events(self, actor: str, channel: str, since_ts: int) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM recovery_events
+                WHERE actor = ? AND channel = ? AND created_at >= ?
+                """,
+                (actor, channel, since_ts),
+            ).fetchone()
+            return int(row["total"]) if row else 0
+
+    def list_recent_recovery_events(self, limit: int = 20) -> List[sqlite3.Row]:
+        with self._connect() as conn:
+            return conn.execute(
+                """
+                SELECT * FROM recovery_events
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()

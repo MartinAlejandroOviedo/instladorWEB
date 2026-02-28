@@ -5,8 +5,10 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Any
 import secrets
+import time
 
 from .auth import hash_panel_password, is_legacy_sha256_hash, verify_panel_password
+from .crypto import decrypt_string, encrypt_string
 from .services import DNSConfig
 from .storage import PanelStore
 from .validators import (
@@ -55,6 +57,9 @@ ROLE_PERMISSIONS = {
     },
 }
 
+RECOVERY_RATE_LIMIT = 5
+RECOVERY_RATE_WINDOW_SECONDS = 60 * 60
+
 
 class PanelManager:
     def __init__(self, store: PanelStore | None = None) -> None:
@@ -87,13 +92,62 @@ class PanelManager:
             raise PermissionError("forbidden")
 
     def verify_panel_login(self, username: str, password: str) -> bool:
+        return self.authenticate_panel(username, password)["ok"]
+
+    def get_force_password_change(self) -> bool:
+        return self.store.get_secret_setting("force_password_change", "0") == "1"
+
+    def _set_force_password_change(self, enabled: bool) -> None:
+        self.store.set_secret_setting("force_password_change", "1" if enabled else "0")
+
+    def _clear_temporary_password(self) -> None:
+        self.store.set_secret_setting("temporary_password_hash", "")
+        self.store.set_secret_setting("temporary_password_expires", "")
+
+    def _temporary_password_active(self) -> bool:
+        raw_hash = self.store.get_secret_setting("temporary_password_hash", "")
+        raw_exp = self.store.get_secret_setting("temporary_password_expires", "0").strip()
+        if not raw_hash:
+            return False
+        try:
+            expires_at = int(raw_exp or "0")
+        except ValueError:
+            expires_at = 0
+        if expires_at <= int(time.time()):
+            self._clear_temporary_password()
+            self._set_force_password_change(False)
+            return False
+        return True
+
+    def authenticate_panel(self, username: str, password: str) -> dict[str, Any]:
         expected_user = self.store.get_secret_setting("panel_username")
         expected_hash = self.store.get_secret_setting("panel_password_hash")
-        if username != expected_user or not verify_panel_password(password, expected_hash):
-            return False
+        if username != expected_user:
+            return {"ok": False}
+
+        if self.get_force_password_change() and self._temporary_password_active():
+            temp_hash = self.store.get_secret_setting("temporary_password_hash", "")
+            if verify_panel_password(password, temp_hash):
+                return {
+                    "ok": True,
+                    "username": username,
+                    "role": self.get_panel_role(),
+                    "force_password_change": True,
+                    "auth_method": "temporary",
+                }
+            return {"ok": False}
+
+        if not verify_panel_password(password, expected_hash):
+            return {"ok": False}
         if is_legacy_sha256_hash(expected_hash):
             self.store.set_secret_setting("panel_password_hash", self.hash_panel_password(password))
-        return True
+        return {
+            "ok": True,
+            "username": username,
+            "role": self.get_panel_role(),
+            "force_password_change": self.get_force_password_change(),
+            "auth_method": "permanent",
+        }
 
     def set_panel_role(self, role: str) -> str:
         normalized = self.normalize_role(role)
@@ -107,7 +161,19 @@ class PanelManager:
         self.store.set_secret_setting("panel_username", username)
         self.store.set_secret_setting("panel_password_hash", self.hash_panel_password(password))
         self.store.set_secret_setting("panel_role", self.normalize_role(role or self.get_panel_role()))
+        self._clear_temporary_password()
+        self._set_force_password_change(False)
         self.bump_token_version(username)
+
+    def issue_temporary_password(self, username: str, ttl_seconds: int = 900) -> str:
+        if username != self.get_panel_username(""):
+            raise ValueError("invalid_username")
+        temp_password = f"NP-{secrets.token_urlsafe(9)}"
+        self.store.set_secret_setting("temporary_password_hash", self.hash_panel_password(temp_password))
+        self.store.set_secret_setting("temporary_password_expires", str(int(time.time()) + ttl_seconds))
+        self._set_force_password_change(True)
+        self.bump_token_version(username)
+        return temp_password
 
     def get_security_profile(self) -> dict[str, str]:
         recovery_email, recovery_whatsapp = self.get_recovery_settings()
@@ -153,15 +219,78 @@ class PanelManager:
         self.store.set_public_setting("dns_forwarders", config.forwarders)
         self.store.set_public_setting("dns_allow_recursion", "1" if config.allow_recursion else "0")
 
+    def normalize_phone(self, phone: str) -> str:
+        return "".join(ch for ch in phone if ch.isdigit())
+
+    def mask_phone(self, phone: str) -> str:
+        raw = self.normalize_phone(phone)
+        if not raw:
+            return ""
+        if len(raw) <= 2:
+            return "*" * len(raw)
+        return "*" * max(0, len(raw) - 2) + raw[-2:]
+
+    def _get_recovery_whatsapp_plain(self) -> str:
+        encrypted = self.store.get_secret_setting("recovery_whatsapp_encrypted", "")
+        if encrypted:
+            try:
+                return decrypt_string(encrypted)
+            except ValueError:
+                pass
+        legacy = self.store.get_public_setting("recovery_whatsapp", "")
+        if legacy:
+            self.store.set_secret_setting("recovery_whatsapp_encrypted", encrypt_string(legacy))
+            self.store.set_public_setting("recovery_whatsapp", "")
+            return legacy
+        return ""
+
     def get_recovery_settings(self) -> tuple[str, str]:
         return (
             self.store.get_public_setting("recovery_email", ""),
-            self.store.get_public_setting("recovery_whatsapp", ""),
+            self._get_recovery_whatsapp_plain(),
         )
 
     def save_recovery_settings(self, email: str, whatsapp: str) -> None:
         self.store.set_public_setting("recovery_email", email)
-        self.store.set_public_setting("recovery_whatsapp", whatsapp)
+        normalized = self.normalize_phone(whatsapp)
+        if normalized:
+            self.store.set_secret_setting("recovery_whatsapp_encrypted", encrypt_string(normalized))
+        else:
+            self.store.set_secret_setting("recovery_whatsapp_encrypted", "")
+        self.store.set_public_setting("recovery_whatsapp", "")
+
+    def recovery_whatsapp_matches(self, candidate: str) -> bool:
+        stored = self._get_recovery_whatsapp_plain()
+        return bool(stored and self.normalize_phone(candidate) == self.normalize_phone(stored))
+
+    def recovery_rate_limit_status(self, username: str, channel: str = "whatsapp") -> dict[str, int | bool]:
+        now_ts = int(time.time())
+        since_ts = now_ts - RECOVERY_RATE_WINDOW_SECONDS
+        used = self.store.count_recent_recovery_events(username, channel, since_ts)
+        remaining = max(0, RECOVERY_RATE_LIMIT - used)
+        return {
+            "allowed": used < RECOVERY_RATE_LIMIT,
+            "used": used,
+            "remaining": remaining,
+            "window_seconds": RECOVERY_RATE_WINDOW_SECONDS,
+        }
+
+    def record_recovery_event(
+        self,
+        username: str,
+        channel: str,
+        status: str,
+        requester: str = "",
+        detail: str = "",
+    ) -> None:
+        self.store.add_recovery_event(
+            actor=username,
+            channel=channel,
+            status=status,
+            requester=requester,
+            detail=detail,
+            created_at=int(time.time()),
+        )
 
     def get_public_settings(self) -> dict[str, Any]:
         email, whatsapp = self.get_recovery_settings()
@@ -169,6 +298,7 @@ class PanelManager:
             "dns": asdict(self.get_dns_config()),
             "recovery_email": email,
             "recovery_whatsapp": whatsapp,
+            "recovery_whatsapp_masked": self.mask_phone(whatsapp),
         }
 
     def update_public_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -182,7 +312,7 @@ class PanelManager:
         forwarders = str(dns_payload.get("forwarders", current.forwarders)).strip()
         allow_recursion = bool(dns_payload.get("allow_recursion", current.allow_recursion))
         recovery_email = str(payload.get("recovery_email", self.store.get_public_setting("recovery_email", ""))).strip().lower()
-        recovery_whatsapp = str(payload.get("recovery_whatsapp", self.store.get_public_setting("recovery_whatsapp", ""))).strip()
+        recovery_whatsapp = str(payload.get("recovery_whatsapp", self._get_recovery_whatsapp_plain())).strip()
 
         if not ns1_hostname:
             raise ValueError("ns1_hostname es obligatorio")

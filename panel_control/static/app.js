@@ -11,8 +11,48 @@ const loginView = document.querySelector("#login-view");
 const appView = document.querySelector("#app-view");
 const loginForm = document.querySelector("#login-form");
 const loginError = document.querySelector("#login-error");
+const recoveryForm = document.querySelector("#recovery-form");
+const recoveryMessage = document.querySelector("#recovery-message");
 const globalMessage = document.querySelector("#global-message");
 const sessionUser = document.querySelector("#session-user");
+const forcePasswordView = document.querySelector("#force-password-view");
+const forcePasswordForm = document.querySelector("#force-password-form");
+const forcePasswordMessage = document.querySelector("#force-password-message");
+const tabs = Array.from(document.querySelectorAll(".tab"));
+const panels = Array.from(document.querySelectorAll(".tab-panel"));
+
+const rolePermissions = {
+  superadmin: new Set([
+    "accounts.read",
+    "accounts.write",
+    "domains.read",
+    "domains.write",
+    "dns.read",
+    "dns.write",
+    "settings.read",
+    "settings.write",
+    "apache.read",
+    "apache.write",
+    "ops.preview",
+    "ops.execute",
+    "security.read",
+    "security.write",
+    "web.read",
+    "web.write",
+  ]),
+  operator: new Set([
+    "domains.read",
+    "domains.write",
+    "dns.read",
+    "dns.write",
+    "settings.read",
+    "settings.write",
+    "apache.read",
+    "ops.preview",
+    "security.read",
+    "web.read",
+  ]),
+};
 
 function showGlobalMessage(text, type = "success") {
   globalMessage.textContent = text;
@@ -22,6 +62,11 @@ function showGlobalMessage(text, type = "success") {
 
 function hideGlobalMessage() {
   globalMessage.hidden = true;
+}
+
+function roleHas(permission) {
+  const role = state.user?.role || "superadmin";
+  return (rolePermissions[role] || rolePermissions.superadmin).has(permission);
 }
 
 function setToken(token) {
@@ -61,6 +106,28 @@ async function apiFetch(path, options = {}) {
 function switchView(loggedIn) {
   loginView.hidden = loggedIn;
   appView.hidden = !loggedIn;
+}
+
+function showRecoveryForm(visible) {
+  recoveryForm.hidden = !visible;
+  loginForm.hidden = visible;
+  if (!visible) {
+    recoveryForm.reset();
+    recoveryMessage.hidden = true;
+  }
+}
+
+function showForcePassword(required) {
+  forcePasswordView.hidden = !required;
+}
+
+function activateTab(name) {
+  tabs.forEach((button) => {
+    button.classList.toggle("active", button.dataset.tab === name);
+  });
+  panels.forEach((panel) => {
+    panel.classList.toggle("active", panel.id === `tab-${name}`);
+  });
 }
 
 function resetDomainForm() {
@@ -130,7 +197,7 @@ function renderModules() {
     const tr = document.createElement("tr");
     const enabled = Boolean(item.enabled);
     tr.innerHTML = `
-      <td>${item.name}</td>
+      <td>${item.module}</td>
       <td><span class="${enabled ? "state-on" : "state-off"}">${enabled ? "ON" : "OFF"}</span></td>
     `;
     body.appendChild(tr);
@@ -153,21 +220,56 @@ function renderSettings() {
   document.querySelector("#settings-recovery-whatsapp").value = state.settings.recovery_whatsapp || "";
 }
 
+function applyRoleVisibility() {
+  const settingsTab = document.querySelector("#tab-button-settings");
+  const apacheTab = document.querySelector("#tab-button-apache");
+  const settingsPanel = document.querySelector("#tab-settings");
+  const apachePanel = document.querySelector("#tab-apache");
+  const domainForm = document.querySelector("#domain-form");
+  const dnsForm = document.querySelector("#dns-form");
+  const settingsForm = document.querySelector("#settings-form");
+
+  settingsTab.hidden = !roleHas("settings.read");
+  settingsPanel.hidden = !roleHas("settings.read");
+  apacheTab.hidden = !roleHas("apache.read");
+  apachePanel.hidden = !roleHas("apache.read");
+  domainForm.hidden = !roleHas("domains.write");
+  dnsForm.hidden = !roleHas("dns.write");
+
+  settingsForm.querySelectorAll("input, button").forEach((element) => {
+    element.disabled = !roleHas("settings.write");
+  });
+
+  if ((!roleHas("settings.read") && settingsTab.classList.contains("active")) || (!roleHas("apache.read") && apacheTab.classList.contains("active"))) {
+    activateTab("domains");
+  }
+}
+
 async function loadAll() {
   hideGlobalMessage();
-  const [me, domains, dns, modules, settings] = await Promise.all([
-    apiFetch("/api/me"),
+  const me = await apiFetch("/api/me");
+  state.user = me.user;
+  sessionUser.textContent = state.user ? `${state.user.username} (${state.user.role})` : "";
+  if (state.user?.force_password_change) {
+    state.domains = [];
+    state.dns = [];
+    state.modules = [];
+    state.settings = null;
+    showForcePassword(true);
+    return;
+  }
+  const [domains, dns, modules, settings] = await Promise.all([
     apiFetch("/api/domains"),
     apiFetch("/api/dns"),
     apiFetch("/api/apache/modules"),
     apiFetch("/api/settings"),
   ]);
-  state.user = me.user;
   state.domains = domains.items || [];
   state.dns = dns.items || [];
   state.modules = modules.items || [];
   state.settings = settings.settings || null;
-  sessionUser.textContent = state.user ? `${state.user.username} (${state.user.role})` : "";
+  applyRoleVisibility();
+  showForcePassword(Boolean(state.user?.force_password_change));
   renderDomains();
   renderDns();
   renderModules();
@@ -180,8 +282,17 @@ async function login(username, password) {
     body: JSON.stringify({ username, password }),
   });
   setToken(payload.token);
-  switchView(true);
-  await loadAll();
+  try {
+    await loadAll();
+    loginForm.reset();
+    hideGlobalMessage();
+    showRecoveryForm(false);
+    switchView(true);
+  } catch (error) {
+    setToken("");
+    switchView(false);
+    throw error;
+  }
 }
 
 async function logout(callApi = true) {
@@ -193,15 +304,24 @@ async function logout(callApi = true) {
   }
   setToken("");
   state.user = null;
+  state.domains = [];
+  state.dns = [];
+  state.modules = [];
+  state.settings = null;
+  sessionUser.textContent = "";
+  loginForm.reset();
+  showRecoveryForm(false);
+  resetDomainForm();
+  resetDnsForm();
+  showForcePassword(false);
+  hideGlobalMessage();
+  activateTab("domains");
   switchView(false);
 }
 
-document.querySelectorAll(".tab").forEach((button) => {
+tabs.forEach((button) => {
   button.addEventListener("click", () => {
-    document.querySelectorAll(".tab").forEach((item) => item.classList.toggle("active", item === button));
-    document.querySelectorAll(".tab-panel").forEach((panel) => {
-      panel.classList.toggle("active", panel.id === `tab-${button.dataset.tab}`);
-    });
+    activateTab(button.dataset.tab);
   });
 });
 
@@ -216,6 +336,36 @@ loginForm.addEventListener("submit", async (event) => {
   } catch (error) {
     loginError.textContent = error.message;
     loginError.hidden = false;
+  }
+});
+
+document.querySelector("#show-recovery").addEventListener("click", () => {
+  showRecoveryForm(true);
+  recoveryMessage.hidden = true;
+});
+
+document.querySelector("#hide-recovery").addEventListener("click", () => {
+  showRecoveryForm(false);
+});
+
+recoveryForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  recoveryMessage.hidden = true;
+  try {
+    await apiFetch("/api/recover/start", {
+      method: "POST",
+      body: JSON.stringify({
+        username: document.querySelector("#recovery-username").value.trim(),
+        whatsapp: document.querySelector("#recovery-whatsapp").value.trim(),
+      }),
+    });
+    recoveryMessage.textContent = "Se envio una clave temporal al canal configurado.";
+    recoveryMessage.className = "global-message success";
+    recoveryMessage.hidden = false;
+  } catch (error) {
+    recoveryMessage.textContent = error.message;
+    recoveryMessage.className = "form-error";
+    recoveryMessage.hidden = false;
   }
 });
 
@@ -305,6 +455,27 @@ document.querySelector("#settings-form").addEventListener("submit", async (event
   }
 });
 
+forcePasswordForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  forcePasswordMessage.hidden = true;
+  try {
+    const result = await apiFetch("/api/change-password", {
+      method: "POST",
+      body: JSON.stringify({
+        new_password: document.querySelector("#force-password-new").value,
+        confirm_password: document.querySelector("#force-password-confirm").value,
+      }),
+    });
+    setToken(result.token);
+    forcePasswordForm.reset();
+    await loadAll();
+    showGlobalMessage("Password actualizada.");
+  } catch (error) {
+    forcePasswordMessage.textContent = error.message;
+    forcePasswordMessage.hidden = false;
+  }
+});
+
 document.addEventListener("click", async (event) => {
   const target = event.target;
   if (!(target instanceof HTMLElement)) {
@@ -372,12 +543,13 @@ document.addEventListener("click", async (event) => {
 
 (async function init() {
   if (!state.token) {
+    activateTab("domains");
     switchView(false);
     return;
   }
   try {
-    switchView(true);
     await loadAll();
+    switchView(true);
   } catch (error) {
     logout(false);
   }

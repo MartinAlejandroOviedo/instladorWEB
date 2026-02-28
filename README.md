@@ -19,6 +19,9 @@ instalador y mini panel de control TUI para VPS Debian.
 4. Exponer API por Apache reverse proxy:
 `python3 panel_control_api_proxy_setup.py --server-name panel.tudominio.com --auth-password 'cambiar-esto'`
 
+Tambien podes usar un launcher unificado:
+`python3 start.py`
+
 La UI web basica queda servida por la misma API en `/`.
 
 Ambas TUI ahora piden login. En la primera ejecucion se crea el usuario/password admin y luego se reutiliza para instalacion y configuracion.
@@ -35,6 +38,8 @@ Si se pierde el acceso, se puede escribir `RECUPERAR` en login para intentar res
 - `panel_control_api_proxy_setup.py`: configura systemd + Apache reverse proxy para la API.
 
 La SQLite ahora separa `public_settings` y `secret_settings`. La tabla legacy `settings` se mantiene solo como compatibilidad de lectura para instalaciones anteriores.
+Si no se puede usar `/var/lib/panelctl/panel.db`, el fallback local ahora queda oculto en `~/.local/share/nicepanel/.panel.db`.
+El `recovery_whatsapp` del panel se guarda cifrado con una clave local separada en `~/.local/share/nicepanel/.panel.key` cuando no se usa `/etc/panelctl/panel.key`.
 
 ## Estado operativo actual del panel
 - DNS: importacion desde BIND actual + dominios con NS por zona + CRUD de records + configuracion base del servidor BIND (`named.conf.options` y `named.conf.local`) + reload.
@@ -81,6 +86,10 @@ Los tokens tienen expiracion, revocacion individual y revocacion global por vers
 - `GET /`: login y panel web.
 - pestañas para `Dominios`, `DNS`, `Settings` y `Apache`.
 - usa el mismo token Bearer de la API y guarda la sesion en `localStorage`.
+- adapta visibilidad segun el rol actual y limpia la sesion visual al salir.
+- permite iniciar recuperacion web con usuario + WhatsApp configurado.
+- si entrás con clave temporal, obliga a cambiar la password antes de usar el panel.
+- si cambias `app.css` o `app.js`, conviene recargar con `Ctrl+F5` para evitar cache del navegador.
 
 ## Reverse Proxy API
 - La API queda interna en `127.0.0.1:8088`.
