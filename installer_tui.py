@@ -666,6 +666,20 @@ class InstallerTUI:
             if dep.dependency.required and not dep.installed
         ]
 
+    def missing_optional_packages(self) -> List[str]:
+        return [
+            dep.dependency.package
+            for dep in self.dependencies
+            if not dep.dependency.required and not dep.installed
+        ]
+
+    def missing_detected_packages(self) -> List[str]:
+        return [
+            dep.dependency.package
+            for dep in self.dependencies
+            if not dep.installed
+        ]
+
     def prompt_text(self, prompt: str, initial: str = "", hidden: bool = False) -> str:
         h, w = self.screen.getmaxyx()
         y = max(0, h - 1)
@@ -962,7 +976,7 @@ class InstallerTUI:
         if self.message:
             self.screen.addnstr(h - 3, 2, self.message, w - 4, curses.A_DIM)
 
-        footer = "Teclas: r re-scan | i instalar faltantes | c continuar | q salir"
+        footer = "Teclas: r re-scan | i instalar faltantes detectados | c continuar | q salir"
         self.screen.addnstr(h - 2, 2, footer, w - 4, curses.A_BOLD)
         if self.has_critical_failures():
             self.screen.addnstr(h - 4, 2, "Hay FAIL criticos; no se puede continuar.", w - 4, curses.color_pair(2))
@@ -1137,9 +1151,9 @@ class InstallerTUI:
                 elif key in (ord("r"), ord("R")):
                     self.refresh_preflight()
                 elif key in (ord("i"), ord("I")):
-                    missing = self.missing_required_packages()
+                    missing = self.missing_detected_packages()
                     if not missing:
-                        self.message = "No hay dependencias requeridas faltantes."
+                        self.message = "No hay dependencias faltantes."
                     elif not self.can_apply_changes:
                         self.message = "Para instalar faltantes, ejecuta con sudo/root."
                     else:
@@ -1147,6 +1161,7 @@ class InstallerTUI:
                         self.apply_done = False
                         self.apply_ok = False
                         self.logs = []
+                        self.message = "Instalando dependencias faltantes detectadas."
                         self.state = "apply"
                 elif key in (ord("c"), ord("C")) and not self.has_critical_failures():
                     self.state = "profile"
