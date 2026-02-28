@@ -694,6 +694,7 @@ class PanelAPIHandler(BaseHTTPRequestHandler):
 def run_api(host: str = DEFAULT_API_HOST, port: int = DEFAULT_API_PORT) -> None:
     server = ThreadingHTTPServer((host, port), PanelAPIHandler)
     server.api = PanelAPI()  # type: ignore[attr-defined]
+    base_url = f"http://{host}:{port}"
     print(
         "\n".join(
             [
@@ -702,7 +703,9 @@ def run_api(host: str = DEFAULT_API_HOST, port: int = DEFAULT_API_PORT) -> None:
                 "  /    / / __/ -_) ___/ _ `/ _ \\/ -_) /",
                 " /_/|_/_/\\__/\\__/_/   \\_,_/_//_/\\__/_/",
                 "",
-                f"NicePanel API escuchando en http://{host}:{port}",
+                f"NicePanel API escuchando en {base_url}",
+                f"Web UI: {base_url}/",
+                f"Health: {base_url}/api/health",
             ]
         )
     )
