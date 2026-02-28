@@ -5,23 +5,36 @@ from __future__ import annotations
 import base64
 import hmac
 import json
+import mimetypes
 import secrets
 import time
-from dataclasses import asdict
 from hashlib import sha256
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from .auth import is_legacy_sha256_hash, verify_panel_password
-from .services import DNSConfig, list_apache_modules
+from .core import PanelManager
+from .services import (
+    apply_dns,
+    apply_optimization,
+    dns_apply_preview,
+    import_bind_zones,
+    list_apache_confs,
+    list_apache_modules,
+    list_apache_sites,
+    optimization_preview,
+    set_apache_conf,
+    set_apache_module,
+    set_apache_site,
+)
 from .storage import PanelStore
-from .validators import is_valid_email, is_valid_ipv4, is_valid_ipv4_list
 
 DEFAULT_API_HOST = "127.0.0.1"
 DEFAULT_API_PORT = 8088
 TOKEN_TTL_SECONDS = 8 * 60 * 60
+STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
 def _b64url_encode(raw: bytes) -> str:
@@ -33,101 +46,44 @@ def _b64url_decode(raw: str) -> bytes:
     return base64.urlsafe_b64decode(raw + padding)
 
 
+def _split_resource_id(path: str, prefix: str) -> tuple[bool, int | None]:
+    if path == prefix:
+        return True, None
+    if not path.startswith(prefix + "/"):
+        return False, None
+    tail = path[len(prefix) + 1 :]
+    if not tail.isdigit():
+        return False, None
+    return True, int(tail)
+
+
 class PanelAPI:
     def __init__(self, store: PanelStore | None = None) -> None:
-        self.store = store or PanelStore()
-
-    def get_dns_config(self) -> DNSConfig:
-        return DNSConfig(
-            ns1_hostname=self.store.get_setting("dns_ns1_hostname", "ns1.localdomain"),
-            ns1_ipv4=self.store.get_setting("dns_ns1_ipv4", "127.0.0.1"),
-            ns2_hostname=self.store.get_setting("dns_ns2_hostname", ""),
-            ns2_ipv4=self.store.get_setting("dns_ns2_ipv4", ""),
-            listen_on=self.store.get_setting("dns_listen_on", "any"),
-            forwarders=self.store.get_setting("dns_forwarders", "1.1.1.1,8.8.8.8"),
-            allow_recursion=self.store.get_setting("dns_allow_recursion", "1") == "1",
-        )
-
-    def set_dns_config(self, config: DNSConfig) -> None:
-        self.store.set_setting("dns_ns1_hostname", config.ns1_hostname)
-        self.store.set_setting("dns_ns1_ipv4", config.ns1_ipv4)
-        self.store.set_setting("dns_ns2_hostname", config.ns2_hostname)
-        self.store.set_setting("dns_ns2_ipv4", config.ns2_ipv4)
-        self.store.set_setting("dns_listen_on", config.listen_on)
-        self.store.set_setting("dns_forwarders", config.forwarders)
-        self.store.set_setting("dns_allow_recursion", "1" if config.allow_recursion else "0")
-
-    def get_public_settings(self) -> dict[str, Any]:
-        return {
-            "dns": asdict(self.get_dns_config()),
-            "recovery_email": self.store.get_setting("recovery_email", ""),
-            "recovery_whatsapp": self.store.get_setting("recovery_whatsapp", ""),
-        }
-
-    def update_public_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
-        dns_payload = payload.get("dns", {})
-        current = self.get_dns_config()
-        ns1_hostname = str(dns_payload.get("ns1_hostname", current.ns1_hostname)).strip().lower().rstrip(".")
-        ns1_ipv4 = str(dns_payload.get("ns1_ipv4", current.ns1_ipv4)).strip()
-        ns2_hostname = str(dns_payload.get("ns2_hostname", current.ns2_hostname)).strip().lower().rstrip(".")
-        ns2_ipv4 = str(dns_payload.get("ns2_ipv4", current.ns2_ipv4)).strip()
-        listen_on = str(dns_payload.get("listen_on", current.listen_on)).strip()
-        forwarders = str(dns_payload.get("forwarders", current.forwarders)).strip()
-        allow_recursion = bool(dns_payload.get("allow_recursion", current.allow_recursion))
-        recovery_email = str(payload.get("recovery_email", self.store.get_setting("recovery_email", ""))).strip().lower()
-        recovery_whatsapp = str(payload.get("recovery_whatsapp", self.store.get_setting("recovery_whatsapp", ""))).strip()
-
-        if not ns1_hostname:
-            raise ValueError("ns1_hostname es obligatorio")
-        if "." not in ns1_hostname:
-            raise ValueError("ns1_hostname debe ser FQDN")
-        if not is_valid_ipv4(ns1_ipv4):
-            raise ValueError("ns1_ipv4 invalido")
-        if ns2_hostname and "." not in ns2_hostname:
-            raise ValueError("ns2_hostname debe ser FQDN")
-        if ns2_ipv4 and not is_valid_ipv4(ns2_ipv4):
-            raise ValueError("ns2_ipv4 invalido")
-        if ns2_hostname and not ns2_ipv4:
-            raise ValueError("falta ns2_ipv4")
-        if ns2_ipv4 and not ns2_hostname:
-            raise ValueError("falta ns2_hostname")
-        if listen_on.lower() != "any" and not is_valid_ipv4_list(listen_on):
-            raise ValueError("listen_on invalido")
-        if not is_valid_ipv4_list(forwarders):
-            raise ValueError("forwarders invalidos")
-        if recovery_email and not is_valid_email(recovery_email):
-            raise ValueError("recovery_email invalido")
-
-        self.set_dns_config(
-            DNSConfig(
-                ns1_hostname=ns1_hostname,
-                ns1_ipv4=ns1_ipv4,
-                ns2_hostname=ns2_hostname,
-                ns2_ipv4=ns2_ipv4,
-                listen_on=listen_on or "any",
-                forwarders=forwarders,
-                allow_recursion=allow_recursion,
-            )
-        )
-        self.store.set_setting("recovery_email", recovery_email)
-        self.store.set_setting("recovery_whatsapp", recovery_whatsapp)
-        return self.get_public_settings()
+        self.manager = PanelManager(store or PanelStore())
+        self.store = self.manager.store
 
     def _get_api_secret(self) -> str:
-        secret = self.store.get_setting("api_secret")
+        secret = self.store.get_secret_setting("api_secret")
         if secret:
             return secret
         secret = secrets.token_urlsafe(32)
-        self.store.set_setting("api_secret", secret)
+        self.store.set_secret_setting("api_secret", secret)
         return secret
 
     def issue_token(self, username: str) -> str:
-        payload = {"u": username, "exp": int(time.time()) + TOKEN_TTL_SECONDS}
+        payload = {
+            "u": username,
+            "r": self.manager.get_panel_role(),
+            "exp": int(time.time()) + TOKEN_TTL_SECONDS,
+            "ver": self.manager.get_token_version(username),
+            "jti": self.manager.issue_token_id(),
+        }
         encoded = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
         signature = hmac.new(self._get_api_secret().encode("utf-8"), encoded.encode("utf-8"), sha256).digest()
         return f"{encoded}.{_b64url_encode(signature)}"
 
     def verify_token(self, token: str) -> dict[str, Any] | None:
+        self.store.purge_expired_revoked_tokens(int(time.time()))
         try:
             encoded, raw_signature = token.split(".", 1)
         except ValueError:
@@ -143,20 +99,30 @@ class PanelAPI:
             payload = json.loads(_b64url_decode(encoded).decode("utf-8"))
         except Exception:
             return None
-        if int(payload.get("exp", 0)) < int(time.time()):
+        now_ts = int(time.time())
+        if int(payload.get("exp", 0)) < now_ts:
+            return None
+        username = str(payload.get("u", ""))
+        if not username:
+            return None
+        payload["r"] = self.manager.get_panel_role()
+        if int(payload.get("ver", 0)) != self.manager.get_token_version(username):
+            return None
+        jti = str(payload.get("jti", ""))
+        if not jti or self.store.is_token_revoked(jti):
             return None
         return payload
 
     def authenticate(self, username: str, password: str) -> str | None:
-        expected_user = self.store.get_setting("panel_username")
-        expected_hash = self.store.get_setting("panel_password_hash")
-        if username != expected_user or not verify_panel_password(password, expected_hash):
+        if not self.manager.verify_panel_login(username, password):
             return None
-        if is_legacy_sha256_hash(expected_hash):
-            from .auth import hash_panel_password
-
-            self.store.set_setting("panel_password_hash", hash_panel_password(password))
         return self.issue_token(username)
+
+    def revoke_token(self, payload: dict[str, Any]) -> None:
+        self.store.revoke_token(str(payload["jti"]), int(payload["exp"]))
+
+    def revoke_all_tokens(self, username: str) -> int:
+        return self.manager.bump_token_version(username)
 
 
 class PanelAPIHandler(BaseHTTPRequestHandler):
@@ -176,6 +142,35 @@ class PanelAPIHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
+
+    def _send_bytes(self, status: int, raw: bytes, content_type: str) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _serve_static(self, path: str) -> bool:
+        if path == "/":
+            file_path = STATIC_DIR / "index.html"
+        elif path.startswith("/assets/"):
+            file_path = STATIC_DIR / path.removeprefix("/assets/")
+        else:
+            return False
+        try:
+            resolved = file_path.resolve()
+        except FileNotFoundError:
+            self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
+            return True
+        if STATIC_DIR not in resolved.parents and resolved != STATIC_DIR / "index.html":
+            self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
+            return True
+        if not resolved.exists() or not resolved.is_file():
+            self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
+            return True
+        content_type, _ = mimetypes.guess_type(str(resolved))
+        self._send_bytes(HTTPStatus.OK, resolved.read_bytes(), content_type or "application/octet-stream")
+        return True
 
     def _read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0") or "0")
@@ -197,8 +192,17 @@ class PanelAPIHandler(BaseHTTPRequestHandler):
             return None
         return payload
 
+    def _require_permission(self, auth: dict[str, Any], permission: str) -> bool:
+        role = str(auth.get("r", ""))
+        if self.api.manager.has_permission(role, permission):
+            return True
+        self._send_json(HTTPStatus.FORBIDDEN, {"ok": False, "error": "forbidden", "required": permission})
+        return False
+
     def do_GET(self) -> None:
         path = urlparse(self.path).path
+        if self._serve_static(path):
+            return
         if path == "/api/health":
             self._send_json(HTTPStatus.OK, {"ok": True, "service": "panel-api"})
             return
@@ -208,66 +212,302 @@ class PanelAPIHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/me":
-            self._send_json(HTTPStatus.OK, {"ok": True, "user": {"username": auth["u"]}})
+            self._send_json(HTTPStatus.OK, {"ok": True, "user": {"username": auth["u"], "role": auth["r"]}})
             return
         if path == "/api/domains":
+            if not self._require_permission(auth, "domains.read"):
+                return
             self._send_json(HTTPStatus.OK, {"ok": True, "items": [dict(row) for row in self.api.store.list_domains()]})
             return
         if path == "/api/dns":
+            if not self._require_permission(auth, "dns.read"):
+                return
             self._send_json(HTTPStatus.OK, {"ok": True, "items": [dict(row) for row in self.api.store.list_dns()]})
             return
         if path == "/api/apache/modules":
+            if not self._require_permission(auth, "apache.read"):
+                return
             self._send_json(HTTPStatus.OK, {"ok": True, "items": list_apache_modules()})
             return
+        if path == "/api/apache/sites":
+            if not self._require_permission(auth, "apache.read"):
+                return
+            self._send_json(HTTPStatus.OK, {"ok": True, "items": list_apache_sites()})
+            return
+        if path == "/api/apache/confs":
+            if not self._require_permission(auth, "apache.read"):
+                return
+            self._send_json(HTTPStatus.OK, {"ok": True, "items": list_apache_confs()})
+            return
         if path == "/api/settings":
-            self._send_json(HTTPStatus.OK, {"ok": True, "settings": self.api.get_public_settings()})
+            if not self._require_permission(auth, "settings.read"):
+                return
+            self._send_json(HTTPStatus.OK, {"ok": True, "settings": self.api.manager.get_public_settings()})
             return
         self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
-        if path != "/api/login":
-            self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
-            return
         try:
             payload = self._read_json()
         except json.JSONDecodeError:
             self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_json"})
             return
 
-        username = str(payload.get("username", "")).strip()
-        password = str(payload.get("password", ""))
-        token = self.api.authenticate(username, password)
-        if not token:
-            self._send_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "invalid_credentials"})
+        if path == "/api/login":
+            username = str(payload.get("username", "")).strip()
+            password = str(payload.get("password", ""))
+            token = self.api.authenticate(username, password)
+            if not token:
+                self._send_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "invalid_credentials"})
+                return
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    "token": token,
+                    "user": {"username": username, "role": self.api.manager.get_panel_role()},
+                    "expires_in": TOKEN_TTL_SECONDS,
+                },
+            )
             return
-        self._send_json(
-            HTTPStatus.OK,
-            {"ok": True, "token": token, "user": {"username": username}, "expires_in": TOKEN_TTL_SECONDS},
-        )
+
+        auth = self._require_auth()
+        if auth is None:
+            return
+
+        try:
+            if path == "/api/domains":
+                if not self._require_permission(auth, "domains.write"):
+                    return
+                item = self.api.manager.create_domain(payload)
+                self._send_json(HTTPStatus.CREATED, {"ok": True, "item": item})
+                return
+            if path == "/api/dns":
+                if not self._require_permission(auth, "dns.write"):
+                    return
+                item = self.api.manager.create_dns(payload)
+                self._send_json(HTTPStatus.CREATED, {"ok": True, "item": item})
+                return
+            if path == "/api/ops/import-bind":
+                if not self._require_permission(auth, "ops.execute"):
+                    return
+                persist = bool(payload.get("persist", True))
+                result = import_bind_zones()
+                if not result.ok:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {"ok": False, "error": "import_bind_failed", "logs": result.logs},
+                    )
+                    return
+                if persist:
+                    domain_rows = [
+                        (
+                            str(item.get("domain", "")),
+                            str(item.get("ns1_hostname", "")),
+                            str(item.get("ns1_ipv4", "")),
+                            str(item.get("ns2_hostname", "")),
+                            str(item.get("ns2_ipv4", "")),
+                        )
+                        for item in result.domains
+                    ]
+                    record_rows = [
+                        (
+                            str(item.get("zone", "")),
+                            str(item.get("name", "")),
+                            str(item.get("type", "")),
+                            str(item.get("value", "")),
+                            int(item.get("ttl", 300)),
+                        )
+                        for item in result.records
+                    ]
+                    self.api.store.replace_domains(domain_rows)
+                    self.api.store.replace_dns_records(record_rows)
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "ok": True,
+                        "persisted": persist,
+                        "domains": result.domains,
+                        "records": result.records,
+                        "logs": result.logs,
+                    },
+                )
+                return
+            if path == "/api/ops/dns/preview":
+                if not self._require_permission(auth, "ops.preview"):
+                    return
+                self._send_json(HTTPStatus.OK, {"ok": True, "logs": dns_apply_preview()})
+                return
+            if path == "/api/ops/dns/apply":
+                if not self._require_permission(auth, "ops.execute"):
+                    return
+                result = apply_dns(
+                    [dict(row) for row in self.api.store.list_dns()],
+                    [dict(row) for row in self.api.store.list_domains()],
+                    self.api.manager.get_dns_config(),
+                )
+                status = HTTPStatus.OK if result.ok else HTTPStatus.BAD_REQUEST
+                self._send_json(status, {"ok": result.ok, "logs": result.logs})
+                return
+            if path == "/api/ops/optimization/preview":
+                if not self._require_permission(auth, "ops.preview"):
+                    return
+                self._send_json(HTTPStatus.OK, {"ok": True, "logs": optimization_preview()})
+                return
+            if path == "/api/ops/optimization/apply":
+                if not self._require_permission(auth, "ops.execute"):
+                    return
+                result = apply_optimization()
+                status = HTTPStatus.OK if result.ok else HTTPStatus.BAD_REQUEST
+                self._send_json(status, {"ok": result.ok, "logs": result.logs})
+                return
+            if path == "/api/ops/apache/module":
+                if not self._require_permission(auth, "apache.write"):
+                    return
+                module = str(payload.get("name", "")).strip()
+                enabled = bool(payload.get("enabled", False))
+                if not module:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "missing_module_name"})
+                    return
+                result = set_apache_module(module, enabled)
+                status = HTTPStatus.OK if result.ok else HTTPStatus.BAD_REQUEST
+                self._send_json(status, {"ok": result.ok, "logs": result.logs})
+                return
+            if path == "/api/ops/apache/site":
+                if not self._require_permission(auth, "apache.write"):
+                    return
+                site = str(payload.get("name", "")).strip()
+                enabled = bool(payload.get("enabled", False))
+                if not site:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "missing_site_name"})
+                    return
+                result = set_apache_site(site, enabled)
+                status = HTTPStatus.OK if result.ok else HTTPStatus.BAD_REQUEST
+                self._send_json(status, {"ok": result.ok, "logs": result.logs})
+                return
+            if path == "/api/ops/apache/conf":
+                if not self._require_permission(auth, "apache.write"):
+                    return
+                conf = str(payload.get("name", "")).strip()
+                enabled = bool(payload.get("enabled", False))
+                if not conf:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "missing_conf_name"})
+                    return
+                result = set_apache_conf(conf, enabled)
+                status = HTTPStatus.OK if result.ok else HTTPStatus.BAD_REQUEST
+                self._send_json(status, {"ok": result.ok, "logs": result.logs})
+                return
+            if path == "/api/logout":
+                self.api.revoke_token(auth)
+                self._send_json(HTTPStatus.OK, {"ok": True})
+                return
+            if path == "/api/logout-all":
+                version = self.api.revoke_all_tokens(str(auth["u"]))
+                self._send_json(HTTPStatus.OK, {"ok": True, "token_version": version})
+                return
+        except ValueError as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+            return
+
+        self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
 
     def do_PUT(self) -> None:
         path = urlparse(self.path).path
         auth = self._require_auth()
         if auth is None:
             return
-        if path != "/api/settings":
-            self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
-            return
         try:
             payload = self._read_json()
-            settings = self.api.update_public_settings(payload)
         except json.JSONDecodeError:
             self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_json"})
             return
+
+        match, item_id = _split_resource_id(path, "/api/domains")
+        if match and item_id is not None:
+            try:
+                item = self.api.manager.update_domain(item_id, payload)
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                return
+            except KeyError:
+                self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "domain_not_found"})
+                return
+            self._send_json(HTTPStatus.OK, {"ok": True, "item": item})
+            return
+
+        match, item_id = _split_resource_id(path, "/api/dns")
+        if match and item_id is not None:
+            try:
+                item = self.api.manager.update_dns(item_id, payload)
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                return
+            except KeyError:
+                self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "dns_not_found"})
+                return
+            self._send_json(HTTPStatus.OK, {"ok": True, "item": item})
+            return
+
+        if path != "/api/settings":
+            self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
+            return
+
+        if not self._require_permission(auth, "settings.write"):
+            return
+        try:
+            settings = self.api.manager.update_public_settings(payload)
         except ValueError as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
             return
         self._send_json(HTTPStatus.OK, {"ok": True, "settings": settings})
 
+    def do_DELETE(self) -> None:
+        path = urlparse(self.path).path
+        auth = self._require_auth()
+        if auth is None:
+            return
+
+        match, item_id = _split_resource_id(path, "/api/domains")
+        if match and item_id is not None:
+            if not self._require_permission(auth, "domains.write"):
+                return
+            try:
+                self.api.manager.delete_domain(item_id)
+            except KeyError:
+                self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "domain_not_found"})
+                return
+            self._send_json(HTTPStatus.OK, {"ok": True})
+            return
+
+        match, item_id = _split_resource_id(path, "/api/dns")
+        if match and item_id is not None:
+            if not self._require_permission(auth, "dns.write"):
+                return
+            try:
+                self.api.manager.delete_dns(item_id)
+            except KeyError:
+                self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "dns_not_found"})
+                return
+            self._send_json(HTTPStatus.OK, {"ok": True})
+            return
+
+        self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
+
 
 def run_api(host: str = DEFAULT_API_HOST, port: int = DEFAULT_API_PORT) -> None:
     server = ThreadingHTTPServer((host, port), PanelAPIHandler)
     server.api = PanelAPI()  # type: ignore[attr-defined]
-    print(f"Panel API escuchando en http://{host}:{port}")
+    print(
+        "\n".join(
+            [
+                "    _  ___         ___                __",
+                "   / |/ (_)______ / _ \\___ ____  ___ / /",
+                "  /    / / __/ -_) ___/ _ `/ _ \\/ -_) /",
+                " /_/|_/_/\\__/\\__/_/   \\_,_/_//_/\\__/_/",
+                "",
+                f"NicePanel API escuchando en http://{host}:{port}",
+            ]
+        )
+    )
     server.serve_forever()

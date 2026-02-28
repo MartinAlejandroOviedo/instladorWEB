@@ -22,9 +22,8 @@ import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-from panel_control.auth import hash_panel_password, is_legacy_sha256_hash, verify_panel_password
+from panel_control.core import PanelManager
 from panel_control.services import send_recovery_code
-from panel_control.storage import PanelStore
 
 
 @dataclass
@@ -607,7 +606,8 @@ def build_missing_deps_plan(packages: List[str]) -> List[PlanAction]:
 class InstallerTUI:
     def __init__(self, screen: "curses.window") -> None:
         self.screen = screen
-        self.auth_store = PanelStore()
+        self.auth = PanelManager()
+        self.auth_store = self.auth.store
         self.state = "splash"
         self.running = True
 
@@ -690,12 +690,10 @@ class InstallerTUI:
             curses.curs_set(0)
 
     def panel_password_hash(self, password: str) -> str:
-        return hash_panel_password(password)
+        return self.auth.hash_panel_password(password)
 
     def ensure_panel_login(self) -> bool:
-        username = self.auth_store.get_setting("panel_username")
-        password_hash = self.auth_store.get_setting("panel_password_hash")
-        if username and password_hash:
+        if self.auth.has_panel_credentials():
             return True
 
         self.screen.erase()
@@ -713,8 +711,7 @@ class InstallerTUI:
         if password != confirm:
             self.message = "Las passwords no coinciden."
             return False
-        self.auth_store.set_setting("panel_username", username)
-        self.auth_store.set_setting("panel_password_hash", self.panel_password_hash(password))
+        self.auth.set_panel_credentials(username, password)
         self.message = "Acceso inicial creado."
         return True
 
@@ -726,19 +723,18 @@ class InstallerTUI:
         if username.lower() == "recuperar":
             return self.recover_panel_access()
         password = self.prompt_text("Password", hidden=True)
-        expected_user = self.auth_store.get_setting("panel_username")
-        expected_hash = self.auth_store.get_setting("panel_password_hash")
-        if username == expected_user and verify_panel_password(password, expected_hash):
-            if is_legacy_sha256_hash(expected_hash):
-                self.auth_store.set_setting("panel_password_hash", self.panel_password_hash(password))
+        if self.auth.verify_panel_login(username, password):
+            role = self.auth.get_panel_role()
+            if role != "superadmin":
+                self.message = "El instalador requiere rol superadmin."
+                return False
             self.message = f"Sesion iniciada: {username}"
             return True
         self.message = "Login invalido."
         return False
 
     def recover_panel_access(self) -> bool:
-        email = self.auth_store.get_setting("recovery_email", "")
-        whatsapp = self.auth_store.get_setting("recovery_whatsapp", "")
+        email, whatsapp = self.auth.get_recovery_settings()
         result = send_recovery_code(email, whatsapp)
         self.message = result.logs[-1] if result.logs else "Recuperacion iniciada."
         if not result.ok:
@@ -749,7 +745,7 @@ class InstallerTUI:
             self.message = "Codigo de recuperacion invalido."
             return False
 
-        username = self.prompt_text("Nuevo usuario admin", self.auth_store.get_setting("panel_username", "admin")).strip()
+        username = self.prompt_text("Nuevo usuario admin", self.auth.get_panel_username("admin")).strip()
         password = self.prompt_text("Nuevo password admin", hidden=True)
         confirm = self.prompt_text("Repetir password", hidden=True)
         if not username:
@@ -761,8 +757,7 @@ class InstallerTUI:
         if password != confirm:
             self.message = "Las passwords no coinciden."
             return False
-        self.auth_store.set_setting("panel_username", username)
-        self.auth_store.set_setting("panel_password_hash", self.panel_password_hash(password))
+        self.auth.set_panel_credentials(username, password)
         self.message = "Acceso restablecido."
         return True
 
@@ -895,8 +890,13 @@ class InstallerTUI:
     def draw_splash(self) -> None:
         self.screen.erase()
         h, w = self.screen.getmaxyx()
-        self.draw_header("Panel Debian Web Host - Instalador", "Fase 0 - Aviso")
+        self.draw_header("NicePanel - Instalador", "Fase 0 - Aviso")
         lines = [
+            "    _  ___         ___                __",
+            "   / |/ (_)______ / _ \\___ ____  ___ / /",
+            "  /    / / __/ -_) ___/ _ `/ _ \\/ -_) /",
+            " /_/|_/_/\\__/\\__/_/   \\_,_/_//_/\\__/_/",
+            "",
             "Este instalador modifica Apache, UFW, systemd y paquetes del sistema.",
             "Recomendado: snapshot/backup antes de aplicar cambios.",
             "",

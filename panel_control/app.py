@@ -6,7 +6,7 @@ import curses
 import hashlib
 from typing import List
 
-from .auth import hash_panel_password, is_legacy_sha256_hash, verify_panel_password
+from .core import PanelManager
 from .services import (
     DNSConfig,
     WebUpdateConfig,
@@ -31,7 +31,6 @@ from .services import (
     set_apache_site,
     web_update_preflight,
 )
-from .storage import PanelStore
 from .validators import (
     is_valid_domain,
     is_valid_email,
@@ -45,7 +44,8 @@ from .validators import (
 class ControlPanelTUI:
     def __init__(self, screen: "curses.window") -> None:
         self.screen = screen
-        self.store = PanelStore()
+        self.manager = PanelManager()
+        self.store = self.manager.store
         self.running = True
         self.state = "menu"
         self.menu_index = 0
@@ -56,6 +56,7 @@ class ControlPanelTUI:
         self.web_update_config = WebUpdateConfig(repo_url="")
         self.web_update_downloaded = False
         self.web_update_commit = ""
+        self.session_role = self.manager.get_panel_role()
 
     def prompt_text(self, prompt: str, initial: str = "", hidden: bool = False) -> str:
         h, w = self.screen.getmaxyx()
@@ -81,47 +82,37 @@ class ControlPanelTUI:
             curses.curs_set(0)
 
     def panel_password_hash(self, password: str) -> str:
-        return hash_panel_password(password)
+        return self.manager.hash_panel_password(password)
 
     def draw_header(self, title: str, subtitle: str) -> None:
         h, w = self.screen.getmaxyx()
         self.screen.addnstr(0, 2, title, w - 4, curses.A_BOLD)
-        self.screen.addnstr(1, 2, subtitle, w - 4, curses.A_DIM)
+        role_suffix = f" | rol: {self.session_role}"
+        self.screen.addnstr(1, 2, f"{subtitle}{role_suffix}", w - 4, curses.A_DIM)
+
+    def has_permission(self, permission: str) -> bool:
+        return self.manager.has_permission(self.session_role, permission)
+
+    def require_permission(self, permission: str, message: str = "Operacion no permitida para tu rol.") -> bool:
+        if self.has_permission(permission):
+            return True
+        self.message = message
+        return False
 
     def get_dns_config(self) -> DNSConfig:
-        return DNSConfig(
-            ns1_hostname=self.store.get_setting("dns_ns1_hostname", "ns1.localdomain"),
-            ns1_ipv4=self.store.get_setting("dns_ns1_ipv4", "127.0.0.1"),
-            ns2_hostname=self.store.get_setting("dns_ns2_hostname", ""),
-            ns2_ipv4=self.store.get_setting("dns_ns2_ipv4", ""),
-            listen_on=self.store.get_setting("dns_listen_on", "any"),
-            forwarders=self.store.get_setting("dns_forwarders", "1.1.1.1,8.8.8.8"),
-            allow_recursion=self.store.get_setting("dns_allow_recursion", "1") == "1",
-        )
+        return self.manager.get_dns_config()
 
     def save_dns_config(self, config: DNSConfig) -> None:
-        self.store.set_setting("dns_ns1_hostname", config.ns1_hostname)
-        self.store.set_setting("dns_ns1_ipv4", config.ns1_ipv4)
-        self.store.set_setting("dns_ns2_hostname", config.ns2_hostname)
-        self.store.set_setting("dns_ns2_ipv4", config.ns2_ipv4)
-        self.store.set_setting("dns_listen_on", config.listen_on)
-        self.store.set_setting("dns_forwarders", config.forwarders)
-        self.store.set_setting("dns_allow_recursion", "1" if config.allow_recursion else "0")
+        self.manager.save_dns_config(config)
 
     def get_recovery_settings(self) -> tuple[str, str]:
-        return (
-            self.store.get_setting("recovery_email", ""),
-            self.store.get_setting("recovery_whatsapp", ""),
-        )
+        return self.manager.get_recovery_settings()
 
     def save_recovery_settings(self, email: str, whatsapp: str) -> None:
-        self.store.set_setting("recovery_email", email)
-        self.store.set_setting("recovery_whatsapp", whatsapp)
+        self.manager.save_recovery_settings(email, whatsapp)
 
     def ensure_panel_login(self) -> bool:
-        username = self.store.get_setting("panel_username")
-        password_hash = self.store.get_setting("panel_password_hash")
-        if username and password_hash:
+        if self.manager.has_panel_credentials():
             return True
 
         self.screen.erase()
@@ -139,8 +130,7 @@ class ControlPanelTUI:
         if password != confirm:
             self.message = "Las passwords no coinciden."
             return False
-        self.store.set_setting("panel_username", username)
-        self.store.set_setting("panel_password_hash", self.panel_password_hash(password))
+        self.manager.set_panel_credentials(username, password)
         self.message = "Acceso inicial creado."
         return True
 
@@ -156,7 +146,7 @@ class ControlPanelTUI:
             self.message = "Codigo de recuperacion invalido."
             return False
 
-        username = self.prompt_text("Nuevo usuario admin", self.store.get_setting("panel_username", "admin")).strip()
+        username = self.prompt_text("Nuevo usuario admin", self.manager.get_panel_username("admin")).strip()
         password = self.prompt_text("Nuevo password admin", hidden=True)
         confirm = self.prompt_text("Repetir password", hidden=True)
         if not username:
@@ -168,8 +158,7 @@ class ControlPanelTUI:
         if password != confirm:
             self.message = "Las passwords no coinciden."
             return False
-        self.store.set_setting("panel_username", username)
-        self.store.set_setting("panel_password_hash", self.panel_password_hash(password))
+        self.manager.set_panel_credentials(username, password)
         self.message = "Acceso restablecido."
         return True
 
@@ -181,18 +170,15 @@ class ControlPanelTUI:
         if username.lower() == "recuperar":
             return self.recover_panel_access()
         password = self.prompt_text("Password", hidden=True)
-        expected_user = self.store.get_setting("panel_username")
-        expected_hash = self.store.get_setting("panel_password_hash")
-        if username == expected_user and verify_panel_password(password, expected_hash):
-            if is_legacy_sha256_hash(expected_hash):
-                self.store.set_setting("panel_password_hash", self.panel_password_hash(password))
+        if self.manager.verify_panel_login(username, password):
+            self.session_role = self.manager.get_panel_role()
             self.message = f"Sesion iniciada: {username}"
             return True
         self.message = "Login invalido."
         return False
 
     def update_panel_login(self) -> None:
-        current_user = self.store.get_setting("panel_username", "admin")
+        current_user = self.manager.get_panel_username("admin")
         username = self.prompt_text("Usuario admin", current_user).strip()
         password = self.prompt_text("Nuevo password", hidden=True)
         confirm = self.prompt_text("Repetir password", hidden=True)
@@ -205,8 +191,7 @@ class ControlPanelTUI:
         if password != confirm:
             self.message = "Las passwords no coinciden."
             return
-        self.store.set_setting("panel_username", username)
-        self.store.set_setting("panel_password_hash", self.panel_password_hash(password))
+        self.manager.set_panel_credentials(username, password)
         self.message = "Credenciales del panel actualizadas."
 
     def draw_menu(self) -> None:
@@ -214,7 +199,7 @@ class ControlPanelTUI:
         h, w = self.screen.getmaxyx()
         domain_count = len(self.store.list_domains())
         dns_count, ftp_count, mail_count = self.store.get_counts()
-        self.draw_header("Panel de Control (TUI)", "Instalador + mini cPanel opensource")
+        self.draw_header("NicePanel - Panel de Control", "Instalador + mini cPanel opensource")
         options = [
             f"Dominios ({domain_count})",
             f"DNS records ({dns_count})",
@@ -392,15 +377,17 @@ class ControlPanelTUI:
     def draw_security(self) -> None:
         self.screen.erase()
         h, w = self.screen.getmaxyx()
-        username = self.store.get_setting("panel_username", "admin")
+        username = self.manager.get_panel_username("admin")
         recovery_email, recovery_whatsapp = self.get_recovery_settings()
         self.draw_header("Seguridad panel", "Acceso y recuperacion")
         lines = [
             f"Usuario actual: {username}",
+            f"Rol actual: {self.session_role}",
             f"Recovery email: {recovery_email or '(sin definir)'}",
             f"Recovery WhatsApp: {recovery_whatsapp or '(sin definir)'}",
             "",
             "c cambiar usuario/password",
+            "p cambiar rol",
             "r configurar recovery",
             "k probar recovery ahora",
             "b volver",
@@ -408,8 +395,18 @@ class ControlPanelTUI:
         for i, line in enumerate(lines[: h - 6]):
             self.screen.addnstr(4 + i, 2, line, w - 4)
         self.screen.addnstr(h - 3, 2, self.message, w - 4, curses.A_DIM)
-        self.screen.addnstr(h - 2, 2, "Teclas: c credenciales | r recovery | k probar | b volver", w - 4, curses.A_BOLD)
+        self.screen.addnstr(h - 2, 2, "Teclas: c credenciales | p rol | r recovery | k probar | b volver", w - 4, curses.A_BOLD)
         self.screen.refresh()
+
+    def update_panel_role(self) -> None:
+        if not self.require_permission("security.write"):
+            return
+        current_role = self.manager.get_panel_role()
+        role = self.prompt_text("Rol (superadmin/operator)", current_role).strip().lower()
+        normalized = self.manager.normalize_role(role)
+        self.manager.set_panel_role(normalized)
+        self.session_role = normalized
+        self.message = f"Rol actualizado: {normalized}"
 
     def draw_apply_preview(self) -> None:
         self.screen.erase()
@@ -587,10 +584,21 @@ class ControlPanelTUI:
             self.message = "Falta FQDN para NS2."
             return
 
-        self.store.update_domain_dns(item_id, ns1_hostname, ns1_ipv4, ns2_hostname, ns2_ipv4)
+        self.manager.update_domain(
+            item_id,
+            {
+                "domain": str(row["domain"]),
+                "ns1_hostname": ns1_hostname,
+                "ns1_ipv4": ns1_ipv4,
+                "ns2_hostname": ns2_hostname,
+                "ns2_ipv4": ns2_ipv4,
+            },
+        )
         self.message = f"DNS del dominio {row['domain']} actualizado."
 
     def import_current_bind(self) -> None:
+        if not self.require_permission("ops.execute"):
+            return
         result = import_bind_zones()
         self.apply_logs = result.logs
         if not result.ok:
@@ -628,7 +636,7 @@ class ControlPanelTUI:
             self.message = "Dominio invalido."
             return
         try:
-            self.store.add_domain(domain)
+            self.manager.create_domain({"domain": domain})
         except Exception as exc:
             self.message = f"No se pudo agregar dominio: {exc}"
             return
@@ -658,7 +666,7 @@ class ControlPanelTUI:
         except ValueError:
             self.message = "TTL invalido."
             return
-        self.store.add_dns(zone, name, rtype, value, ttl)
+        self.manager.create_dns({"zone": zone, "name": name, "type": rtype, "value": value, "ttl": ttl})
         self.message = "Record DNS agregado."
 
     def add_ftp(self) -> None:
@@ -769,9 +777,11 @@ class ControlPanelTUI:
                     elif self.menu_index == 3:
                         self.state = "optimization"
                     elif self.menu_index == 4:
-                        self.state = "ftp"
+                        if self.require_permission("accounts.read"):
+                            self.state = "ftp"
                     elif self.menu_index == 5:
-                        self.state = "mail"
+                        if self.require_permission("accounts.read"):
+                            self.state = "mail"
                     elif self.menu_index == 6:
                         self.state = "security"
                     elif self.menu_index == 7:
@@ -786,10 +796,16 @@ class ControlPanelTUI:
                 if key in (ord("b"), ord("B")):
                     self.state = "menu"
                 elif key in (ord("a"), ord("A")):
+                    if not self.require_permission("domains.write"):
+                        continue
                     self.add_domain()
                 elif key in (ord("c"), ord("C")):
+                    if not self.require_permission("domains.write"):
+                        continue
                     self.configure_domain_dns()
                 elif key in (ord("d"), ord("D")):
+                    if not self.require_permission("domains.write"):
+                        continue
                     self.delete_by_id("domain")
                 elif key in (ord("i"), ord("I")):
                     self.import_current_bind()
@@ -797,11 +813,15 @@ class ControlPanelTUI:
                 if key in (ord("b"), ord("B")):
                     self.state = "menu"
                 elif key in (ord("a"), ord("A")):
+                    if not self.require_permission("dns.write"):
+                        continue
                     try:
                         self.add_dns()
                     except Exception as exc:
                         self.message = f"Error DNS: {exc}"
                 elif key in (ord("d"), ord("D")):
+                    if not self.require_permission("dns.write"):
+                        continue
                     self.delete_by_id("dns")
                 elif key in (ord("i"), ord("I")):
                     self.import_current_bind()
@@ -809,17 +829,25 @@ class ControlPanelTUI:
                 if key in (ord("b"), ord("B")):
                     self.state = "menu"
                 elif key in (ord("c"), ord("C")):
+                    if not self.require_permission("settings.write"):
+                        continue
                     self.configure_dns_server()
             elif self.state == "optimization":
                 if key in (ord("b"), ord("B")):
                     self.state = "menu"
                 elif key in (ord("r"), ord("R")):
+                    if not self.require_permission("ops.execute"):
+                        continue
                     result = apply_optimization()
                     self.optimization_logs = result.logs
                     self.message = "Optimizacion aplicada." if result.ok else "Optimizacion con errores."
                 elif key in (ord("e"), ord("E")):
+                    if not self.require_permission("apache.write"):
+                        continue
                     self.toggle_apache_module(True)
                 elif key in (ord("x"), ord("X")):
+                    if not self.require_permission("apache.write"):
+                        continue
                     self.toggle_apache_module(False)
                 elif key in (ord("s"), ord("S")):
                     self.state = "apache_sites"
@@ -829,44 +857,68 @@ class ControlPanelTUI:
                 if key in (ord("b"), ord("B")):
                     self.state = "optimization"
                 elif key in (ord("e"), ord("E")):
+                    if not self.require_permission("apache.write"):
+                        continue
                     self.toggle_apache_site(True)
                 elif key in (ord("x"), ord("X")):
+                    if not self.require_permission("apache.write"):
+                        continue
                     self.toggle_apache_site(False)
             elif self.state == "apache_confs":
                 if key in (ord("b"), ord("B")):
                     self.state = "optimization"
                 elif key in (ord("e"), ord("E")):
+                    if not self.require_permission("apache.write"):
+                        continue
                     self.toggle_apache_conf(True)
                 elif key in (ord("x"), ord("X")):
+                    if not self.require_permission("apache.write"):
+                        continue
                     self.toggle_apache_conf(False)
             elif self.state == "ftp":
                 if key in (ord("b"), ord("B")):
                     self.state = "menu"
                 elif key in (ord("a"), ord("A")):
+                    if not self.require_permission("accounts.write"):
+                        continue
                     try:
                         self.add_ftp()
                     except Exception as exc:
                         self.message = f"Error FTP: {exc}"
                 elif key in (ord("d"), ord("D")):
+                    if not self.require_permission("accounts.write"):
+                        continue
                     self.delete_by_id("ftp")
             elif self.state == "mail":
                 if key in (ord("b"), ord("B")):
                     self.state = "menu"
                 elif key in (ord("a"), ord("A")):
+                    if not self.require_permission("accounts.write"):
+                        continue
                     try:
                         self.add_mail()
                     except Exception as exc:
                         self.message = f"Error Mail: {exc}"
                 elif key in (ord("d"), ord("D")):
+                    if not self.require_permission("accounts.write"):
+                        continue
                     self.delete_by_id("mail")
             elif self.state == "security":
                 if key in (ord("b"), ord("B")):
                     self.state = "menu"
                 elif key in (ord("c"), ord("C")):
+                    if not self.require_permission("security.write"):
+                        continue
                     self.update_panel_login()
+                elif key in (ord("p"), ord("P")):
+                    self.update_panel_role()
                 elif key in (ord("r"), ord("R")):
+                    if not self.require_permission("security.write"):
+                        continue
                     self.configure_recovery()
                 elif key in (ord("k"), ord("K")):
+                    if not self.require_permission("security.write"):
+                        continue
                     self.recover_panel_access()
             elif self.state == "preview":
                 if key in (ord("b"), ord("B")):
@@ -875,6 +927,8 @@ class ControlPanelTUI:
                 if key in (ord("b"), ord("B")):
                     self.state = "menu"
                 elif key in (ord("r"), ord("R")):
+                    if not self.require_permission("ops.execute"):
+                        continue
                     dns_result = apply_dns(
                         [dict(r) for r in self.store.list_dns()],
                         [dict(r) for r in self.store.list_domains()],
@@ -890,14 +944,20 @@ class ControlPanelTUI:
                 if key in (ord("b"), ord("B")):
                     self.state = "menu"
                 elif key in (ord("c"), ord("C")):
+                    if not self.require_permission("web.write"):
+                        continue
                     self.configure_web_update()
                 elif key in (ord("d"), ord("D")):
+                    if not self.require_permission("web.write"):
+                        continue
                     result = download_web_update(self.web_update_config)
                     self.web_update_logs = result.logs
                     self.web_update_downloaded = result.downloaded
                     self.web_update_commit = result.commit
                     self.message = "Descarga OK." if result.ok else "Descarga con errores."
                 elif key in (ord("r"), ord("R")):
+                    if not self.require_permission("web.write"):
+                        continue
                     result = replace_web_update(self.web_update_config)
                     self.web_update_logs = result.logs
                     self.message = "Reemplazo OK." if result.ok else "Reemplazo con errores."

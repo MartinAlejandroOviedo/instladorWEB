@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NicePanel</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <div class="page-shell">
+    <section id="login-view" class="hero-card">
+      <pre class="brand-mark">    _  ___         ___                __
+   / |/ (_)______ / _ \___ ____  ___ / /
+  /    / / __/ -_) ___/ _ `/ _ \/ -_) /
+ /_/|_/_/\__/\__/_/   \_,_/_//_/\__/_/</pre>
+      <div class="hero-copy">
+        <p class="eyebrow">Panel web basico</p>
+        <h1>NicePanel</h1>
+        <p class="lede">Login, dominios, DNS, modulos Apache y settings publicos sobre la misma API local.</p>
+      </div>
+      <form id="login-form" class="card form-card">
+        <label>
+          <span>Usuario</span>
+          <input id="login-username" name="username" autocomplete="username" required>
+        </label>
+        <label>
+          <span>Password</span>
+          <input id="login-password" name="password" type="password" autocomplete="current-password" required>
+        </label>
+        <button type="submit" class="button primary">Entrar</button>
+        <p id="login-error" class="form-error" hidden></p>
+      </form>
+    </section>
+
+    <section id="app-view" hidden>
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">NicePanel Web UI</p>
+          <h1>Administracion basica</h1>
+        </div>
+        <div class="topbar-actions">
+          <span id="session-user" class="pill"></span>
+          <button id="refresh-all" class="button ghost" type="button">Refrescar</button>
+          <button id="logout-button" class="button danger" type="button">Salir</button>
+        </div>
+      </header>
+
+      <section class="summary-grid">
+        <article class="summary-card">
+          <span class="summary-label">Dominios</span>
+          <strong id="domains-count">0</strong>
+        </article>
+        <article class="summary-card">
+          <span class="summary-label">DNS records</span>
+          <strong id="dns-count">0</strong>
+        </article>
+        <article class="summary-card">
+          <span class="summary-label">Apache modules</span>
+          <strong id="modules-count">0</strong>
+        </article>
+      </section>
+
+      <nav class="tabs">
+        <button class="tab active" data-tab="domains" type="button">Dominios</button>
+        <button class="tab" data-tab="dns" type="button">DNS</button>
+        <button class="tab" data-tab="settings" type="button">Settings</button>
+        <button class="tab" data-tab="apache" type="button">Apache</button>
+      </nav>
+
+      <p id="global-message" class="global-message" hidden></p>
+
+      <section id="tab-domains" class="tab-panel active">
+        <div class="panel-grid">
+          <form id="domain-form" class="card form-card">
+            <div class="card-head">
+              <h2>Dominio</h2>
+              <button id="domain-reset" class="button ghost" type="button">Limpiar</button>
+            </div>
+            <input id="domain-id" type="hidden">
+            <label><span>Dominio</span><input id="domain-name" required placeholder="example.com"></label>
+            <label><span>NS1 hostname</span><input id="domain-ns1-hostname" placeholder="ns1.example.com"></label>
+            <label><span>NS1 IPv4</span><input id="domain-ns1-ipv4" placeholder="192.0.2.10"></label>
+            <label><span>NS2 hostname</span><input id="domain-ns2-hostname" placeholder="ns2.example.com"></label>
+            <label><span>NS2 IPv4</span><input id="domain-ns2-ipv4" placeholder="192.0.2.11"></label>
+            <div class="form-actions">
+              <button type="submit" class="button primary">Guardar</button>
+            </div>
+          </form>
+
+          <section class="card table-card">
+            <div class="card-head">
+              <h2>Dominios cargados</h2>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>ID</th>
+                    <th>Dominio</th>
+                    <th>NS</th>
+                    <th>Acciones</th>
+                  </tr>
+                </thead>
+                <tbody id="domains-table"></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section id="tab-dns" class="tab-panel">
+        <div class="panel-grid">
+          <form id="dns-form" class="card form-card">
+            <div class="card-head">
+              <h2>DNS record</h2>
+              <button id="dns-reset" class="button ghost" type="button">Limpiar</button>
+            </div>
+            <input id="dns-id" type="hidden">
+            <label><span>Zona</span><input id="dns-zone" required placeholder="example.com"></label>
+            <label><span>Name</span><input id="dns-name" required placeholder="@ o www"></label>
+            <label><span>Tipo</span>
+              <select id="dns-type">
+                <option>A</option>
+                <option>AAAA</option>
+                <option>CNAME</option>
+                <option>MX</option>
+                <option>TXT</option>
+                <option>NS</option>
+              </select>
+            </label>
+            <label><span>Valor</span><input id="dns-value" required placeholder="203.0.113.10"></label>
+            <label><span>TTL</span><input id="dns-ttl" type="number" min="60" step="60" value="300"></label>
+            <div class="form-actions">
+              <button type="submit" class="button primary">Guardar</button>
+            </div>
+          </form>
+
+          <section class="card table-card">
+            <div class="card-head">
+              <h2>Records cargados</h2>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>ID</th>
+                    <th>Zona</th>
+                    <th>Name</th>
+                    <th>Tipo</th>
+                    <th>Valor</th>
+                    <th>TTL</th>
+                    <th>Acciones</th>
+                  </tr>
+                </thead>
+                <tbody id="dns-table"></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section id="tab-settings" class="tab-panel">
+        <div class="panel-grid single">
+          <form id="settings-form" class="card form-card">
+            <div class="card-head">
+              <h2>Settings publicos</h2>
+            </div>
+            <div class="settings-grid">
+              <label><span>NS1 hostname</span><input id="settings-ns1-hostname" required></label>
+              <label><span>NS1 IPv4</span><input id="settings-ns1-ipv4" required></label>
+              <label><span>NS2 hostname</span><input id="settings-ns2-hostname"></label>
+              <label><span>NS2 IPv4</span><input id="settings-ns2-ipv4"></label>
+              <label><span>Listen on</span><input id="settings-listen-on"></label>
+              <label><span>Forwarders</span><input id="settings-forwarders"></label>
+              <label class="checkbox-line"><input id="settings-allow-recursion" type="checkbox"><span>Allow recursion</span></label>
+              <label><span>Recovery email</span><input id="settings-recovery-email" type="email"></label>
+              <label><span>Recovery WhatsApp</span><input id="settings-recovery-whatsapp"></label>
+            </div>
+            <div class="form-actions">
+              <button type="submit" class="button primary">Guardar settings</button>
+            </div>
+          </form>
+        </div>
+      </section>
+
+      <section id="tab-apache" class="tab-panel">
+        <div class="panel-grid single">
+          <section class="card table-card">
+            <div class="card-head">
+              <h2>Modulos Apache</h2>
+              <span class="pill muted">solo lectura por ahora</span>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Modulo</th>
+                    <th>Estado</th>
+                  </tr>
+                </thead>
+                <tbody id="modules-table"></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+      </section>
+    </section>
+  </div>
+  <script src="/assets/app.js"></script>
+</body>
+</html>

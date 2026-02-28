@@ -71,6 +71,21 @@ class PanelStore:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS public_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS secret_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS revoked_tokens (
+                    jti TEXT PRIMARY KEY,
+                    expires_at INTEGER NOT NULL
+                );
                 """
             )
             self._ensure_columns(conn)
@@ -98,6 +113,10 @@ class PanelStore:
 
     def delete_domain(self, item_id: int) -> int:
         with self._connect() as conn:
+            row = conn.execute("SELECT domain FROM domains WHERE id = ?", (item_id,)).fetchone()
+            if not row:
+                return 0
+            conn.execute("DELETE FROM dns_records WHERE zone = ?", (row["domain"],))
             cur = conn.execute("DELETE FROM domains WHERE id = ?", (item_id,))
             return cur.rowcount
 
@@ -112,20 +131,26 @@ class PanelStore:
     def update_domain_dns(
         self,
         item_id: int,
+        domain: str,
         ns1_hostname: str,
         ns1_ipv4: str,
         ns2_hostname: str,
         ns2_ipv4: str,
     ) -> int:
         with self._connect() as conn:
+            current = conn.execute("SELECT domain FROM domains WHERE id = ?", (item_id,)).fetchone()
+            if not current:
+                return 0
             cur = conn.execute(
                 """
                 UPDATE domains
-                SET ns1_hostname = ?, ns1_ipv4 = ?, ns2_hostname = ?, ns2_ipv4 = ?
+                SET domain = ?, ns1_hostname = ?, ns1_ipv4 = ?, ns2_hostname = ?, ns2_ipv4 = ?
                 WHERE id = ?
                 """,
-                (ns1_hostname, ns1_ipv4, ns2_hostname, ns2_ipv4, item_id),
+                (domain, ns1_hostname, ns1_ipv4, ns2_hostname, ns2_ipv4, item_id),
             )
+            if current["domain"] != domain:
+                conn.execute("UPDATE dns_records SET zone = ? WHERE zone = ?", (domain, current["domain"]))
             return cur.rowcount
 
     def upsert_domain(
@@ -176,6 +201,24 @@ class PanelStore:
                 (zone, name, rtype, value, ttl),
             )
             conn.execute("INSERT OR IGNORE INTO domains(domain, enabled) VALUES (?, 1)", (zone,))
+
+    def get_dns(self, item_id: int) -> sqlite3.Row | None:
+        with self._connect() as conn:
+            return conn.execute("SELECT * FROM dns_records WHERE id = ?", (item_id,)).fetchone()
+
+    def update_dns(self, item_id: int, zone: str, name: str, rtype: str, value: str, ttl: int) -> int:
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE dns_records
+                SET zone = ?, name = ?, type = ?, value = ?, ttl = ?
+                WHERE id = ?
+                """,
+                (zone, name, rtype, value, ttl, item_id),
+            )
+            if cur.rowcount:
+                conn.execute("INSERT OR IGNORE INTO domains(domain, enabled) VALUES (?, 1)", (zone,))
+            return cur.rowcount
 
     def delete_dns(self, item_id: int) -> int:
         with self._connect() as conn:
@@ -235,3 +278,53 @@ class PanelStore:
                 """,
                 (key, value),
             )
+
+    def _get_scoped_setting(self, table: str, key: str, default: str = "") -> str:
+        with self._connect() as conn:
+            row = conn.execute(f"SELECT value FROM {table} WHERE key = ?", (key,)).fetchone()
+            if row:
+                return str(row["value"])
+            legacy = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+            return str(legacy["value"]) if legacy else default
+
+    def _set_scoped_setting(self, table: str, key: str, value: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                f"""
+                INSERT INTO {table}(key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (key, value),
+            )
+            conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+
+    def get_public_setting(self, key: str, default: str = "") -> str:
+        return self._get_scoped_setting("public_settings", key, default)
+
+    def set_public_setting(self, key: str, value: str) -> None:
+        self._set_scoped_setting("public_settings", key, value)
+
+    def get_secret_setting(self, key: str, default: str = "") -> str:
+        return self._get_scoped_setting("secret_settings", key, default)
+
+    def set_secret_setting(self, key: str, value: str) -> None:
+        self._set_scoped_setting("secret_settings", key, value)
+
+    def revoke_token(self, jti: str, expires_at: int) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO revoked_tokens(jti, expires_at) VALUES (?, ?)
+                """,
+                (jti, expires_at),
+            )
+
+    def is_token_revoked(self, jti: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute("SELECT 1 FROM revoked_tokens WHERE jti = ?", (jti,)).fetchone()
+            return row is not None
+
+    def purge_expired_revoked_tokens(self, now_ts: int) -> int:
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM revoked_tokens WHERE expires_at < ?", (now_ts,))
+            return cur.rowcount

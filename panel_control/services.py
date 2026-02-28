@@ -47,6 +47,19 @@ class WebUpdateResult:
 
 
 @dataclass
+class APIProxyConfig:
+    server_name: str
+    project_dir: str
+    api_host: str = "127.0.0.1"
+    api_port: int = 8088
+    public_path: str = "/api/"
+    auth_user: str = "nicepanel"
+    auth_password: str = ""
+    service_name: str = "nicepanel-api"
+    site_name: str = "nicepanel-api"
+
+
+@dataclass
 class DNSImportResult:
     ok: bool
     logs: List[str]
@@ -276,6 +289,131 @@ def send_recovery_code(email: str, whatsapp: str) -> RecoveryResult:
         logs.append("[RECOVERY] sin email ni WhatsApp configurados")
         return RecoveryResult(False, logs)
     return RecoveryResult(True, logs, code=code)
+
+
+def api_proxy_preview() -> List[str]:
+    return [
+        "crear /etc/systemd/system/nicepanel-api.service",
+        "crear /etc/panelctl/api.htpasswd",
+        "crear /etc/apache2/sites-available/nicepanel-api.conf",
+        "a2enmod proxy proxy_http headers auth_basic authn_file",
+        "a2ensite nicepanel-api.conf",
+        "systemctl enable --now nicepanel-api",
+        "apache2ctl configtest",
+        "systemctl reload apache2",
+    ]
+
+
+def setup_api_proxy(config: APIProxyConfig) -> OptimizationResult:
+    logs: List[str] = []
+    if not config.server_name.strip():
+        return OptimizationResult(False, ["[API] falta server_name"])
+    if not config.auth_password.strip():
+        return OptimizationResult(False, ["[API] falta auth_password"])
+
+    service_path = f"/etc/systemd/system/{config.service_name}.service"
+    site_path = f"/etc/apache2/sites-available/{config.site_name}.conf"
+    auth_path = "/etc/panelctl/api.htpasswd"
+    launcher_path = os.path.join(config.project_dir, "panel_control_api.py")
+    public_path = config.public_path if config.public_path.endswith("/") else config.public_path + "/"
+    public_path_root = public_path[:-1]
+
+    if not os.path.exists(launcher_path):
+        return OptimizationResult(False, [f"[API] no existe launcher API: {launcher_path}"])
+
+    service_body = f"""
+[Unit]
+Description=NicePanel API
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory={config.project_dir}
+ExecStart=/usr/bin/python3 {launcher_path}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+""".strip()
+    rc, _, err = _run(["bash", "-lc", f"cat > {shlex.quote(service_path)} <<'EOF'\n{service_body}\nEOF"])
+    if rc != 0:
+        return OptimizationResult(False, [f"[API] no se pudo escribir {service_path}: {err}"])
+    logs.append(f"[API] service escrita: {service_path}")
+
+    rc, _, err = _run(["mkdir", "-p", "/etc/panelctl"])
+    if rc != 0:
+        return OptimizationResult(False, logs + [f"[API] no se pudo crear /etc/panelctl: {err}"])
+
+    htpasswd_hash = subprocess.run(
+        ["openssl", "passwd", "-apr1", config.auth_password],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if htpasswd_hash.returncode != 0:
+        return OptimizationResult(False, logs + [f"[API] no se pudo generar hash htpasswd: {htpasswd_hash.stderr.strip()}"])
+    auth_body = f"{config.auth_user}:{htpasswd_hash.stdout.strip()}\n"
+    rc, _, err = _run(["bash", "-lc", f"cat > {shlex.quote(auth_path)} <<'EOF'\n{auth_body}EOF"])
+    if rc != 0:
+        return OptimizationResult(False, logs + [f"[API] no se pudo escribir {auth_path}: {err}"])
+    logs.append(f"[API] auth file escrita: {auth_path}")
+
+    site_body = f"""
+<VirtualHost *:80>
+    ServerName {config.server_name}
+
+    ProxyPreserveHost On
+    ProxyRequests Off
+
+    <Location {public_path_root}>
+        AuthType Basic
+        AuthName "NicePanel API"
+        AuthUserFile {auth_path}
+        Require valid-user
+    </Location>
+
+    ProxyPass {public_path} http://{config.api_host}:{config.api_port}/api/
+    ProxyPassReverse {public_path} http://{config.api_host}:{config.api_port}/api/
+
+    ErrorLog ${{APACHE_LOG_DIR}}/{config.site_name}_error.log
+    CustomLog ${{APACHE_LOG_DIR}}/{config.site_name}_access.log combined
+</VirtualHost>
+""".strip()
+    rc, _, err = _run(["bash", "-lc", f"cat > {shlex.quote(site_path)} <<'EOF'\n{site_body}\nEOF"])
+    if rc != 0:
+        return OptimizationResult(False, logs + [f"[API] no se pudo escribir {site_path}: {err}"])
+    logs.append(f"[API] site escrita: {site_path}")
+
+    rc, _, err = _run(["bash", "-lc", "a2enmod proxy proxy_http headers auth_basic authn_file"])
+    if rc != 0:
+        return OptimizationResult(False, logs + [f"[API] no se pudieron habilitar modulos Apache: {err}"])
+    logs.append("[API] modulos Apache habilitados para reverse proxy")
+
+    rc, _, err = _run(["a2ensite", f"{config.site_name}.conf"])
+    if rc != 0:
+        return OptimizationResult(False, logs + [f"[API] no se pudo habilitar sitio Apache: {err}"])
+    logs.append(f"[API] sitio Apache habilitado: {config.site_name}.conf")
+
+    rc, _, err = _run(["systemctl", "daemon-reload"])
+    if rc != 0:
+        return OptimizationResult(False, logs + [f"[API] no se pudo hacer daemon-reload: {err}"])
+    rc, _, err = _run(["systemctl", "enable", "--now", config.service_name])
+    if rc != 0:
+        return OptimizationResult(False, logs + [f"[API] no se pudo habilitar/iniciar servicio {config.service_name}: {err}"])
+    logs.append(f"[API] servicio habilitado: {config.service_name}")
+
+    rc, out, err = _run(["apache2ctl", "configtest"])
+    if rc != 0:
+        return OptimizationResult(False, logs + [f"[API] apache2ctl configtest fallo: {err or out}"])
+    logs.append("[API] apache2ctl configtest OK")
+
+    rc, _, err = _run(["systemctl", "reload", "apache2"])
+    if rc != 0:
+        return OptimizationResult(False, logs + [f"[API] no se pudo recargar apache2: {err}"])
+    logs.append("[API] apache2 recargado")
+    logs.append(f"[API] reverse proxy activo en http://{config.server_name}{public_path}")
+    return OptimizationResult(True, logs)
 
 
 def optimization_preview() -> List[str]:
