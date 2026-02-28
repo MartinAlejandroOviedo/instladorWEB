@@ -7,4 +7,10 @@ def run_control_panel() -> None:
     _run_control_panel()
 
 
-__all__ = ["run_control_panel"]
+def run_panel_api() -> None:
+    from .api import run_api as _run_api
+
+    _run_api()
+
+
+__all__ = ["run_control_panel", "run_panel_api"]

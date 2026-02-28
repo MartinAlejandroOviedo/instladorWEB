@@ -6,6 +6,8 @@ instalador y mini panel de control TUI para VPS Debian.
 `python3 installer_tui.py`
 2. Luego administrar datos del panel (DNS/FTP/Mail):
 `python3 panel_control_tui.py`
+3. API REST minima del panel:
+`python3 panel_control_api.py`
 
 Ambas TUI ahora piden login. En la primera ejecucion se crea el usuario/password admin y luego se reutiliza para instalacion y configuracion.
 Si se pierde el acceso, se puede escribir `RECUPERAR` en login para intentar reset por email o por un futuro canal WhatsApp.
@@ -17,6 +19,7 @@ Si se pierde el acceso, se puede escribir `RECUPERAR` en login para intentar res
 - `panel_control/validators.py`: validaciones.
 - `panel_control/services.py`: preview de comandos de integracion.
 - `panel_control/app.py`: interfaz TUI de administracion.
+- `panel_control/api.py`: API REST minima usando la misma SQLite.
 
 ## Estado operativo actual del panel
 - DNS: importacion desde BIND actual + dominios con NS por zona + CRUD de records + configuracion base del servidor BIND (`named.conf.options` y `named.conf.local`) + reload.
@@ -24,3 +27,14 @@ Si se pierde el acceso, se puede escribir `RECUPERAR` en login para intentar res
 - FTP: CRUD + apply real a usuarios del sistema + restart `vsftpd`.
 - Mail: CRUD en base local (pendiente integracion full postfix/dovecot).
 - Seguridad: login local para acceder al instalador y al panel de configuracion + recovery email + base lista para recovery por WhatsApp.
+
+## API REST minima
+- `POST /api/login`: recibe `username` y `password`, devuelve token Bearer.
+- `GET /api/me`: usuario autenticado.
+- `GET /api/domains`: dominios guardados.
+- `GET /api/dns`: records DNS guardados.
+- `GET /api/apache/modules`: modulos Apache comunes y estado.
+- `GET /api/settings`: configuracion publica del panel.
+- `PUT /api/settings`: actualiza configuracion publica (`dns`, `recovery_email`, `recovery_whatsapp`).
+
+Por defecto escucha en `127.0.0.1:8088`.
