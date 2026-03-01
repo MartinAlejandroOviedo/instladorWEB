@@ -506,6 +506,9 @@ WantedBy=multi-user.target
     logs.append("[API] apache2 recargado")
     logs.append(f"[API] Web UI activa en http://{config.server_name}/")
     logs.append(f"[API] API publica activa en http://{config.server_name}{public_path}")
+    logs.append(
+        f"[API] Nota: Basic Auth de Apache ({config.auth_user}) es independiente del usuario/password interno de NicePanel."
+    )
     return OptimizationResult(True, logs)
 
 

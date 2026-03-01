@@ -350,6 +350,13 @@ th {
   color: var(--danger);
 }
 
+.form-hint {
+  margin: 0.4rem 0 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+  line-height: 1.4;
+}
+
 .ops-log {
   margin: 0 0 1rem;
   padding: 0.9rem 1rem;
