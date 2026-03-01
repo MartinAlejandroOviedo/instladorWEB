@@ -10,17 +10,19 @@
 instalador y mini panel de control TUI para VPS Debian.
 
 ## Flujo
-1. Ejecutar instalador base:
-`python3 installer_tui.py`
-2. Luego administrar datos del panel (DNS/FTP/Mail):
-`python3 panel_control_tui.py`
-3. API REST minima del panel:
-`python3 panel_control_api.py`
-4. Exponer API por Apache reverse proxy:
-`python3 panel_control_api_proxy_setup.py --server-name panel.tudominio.com --auth-password 'cambiar-esto'`
-
-Tambien podes usar un launcher unificado:
+1. Entrar al launcher unificado:
+`./nicepanel`
+2. Alternativa equivalente:
 `python3 start.py`
+3. Si queres dejarlo global en el VPS:
+`ln -sf /root/instladorWEB/nicepanel /usr/local/bin/nicepanel`
+4. Luego usar siempre:
+`nicepanel`
+
+El menu unificado permite abrir el instalador, el panel TUI y el panel Web/API desde un solo comando.
+
+Para exponer la UI web por Apache reverse proxy:
+`python3 panel_control_api_proxy_setup.py --server-name panel.tudominio.com`
 
 La UI web basica queda servida por la misma API en `/`.
 

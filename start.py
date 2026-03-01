@@ -23,6 +23,10 @@ ALIASES = {
 }
 
 
+def _program_name() -> str:
+    return os.path.basename(sys.argv[0] or "start.py")
+
+
 def _run_command(command: list[str]) -> None:
     os.execvp(command[0], command)
 
@@ -57,7 +61,8 @@ def main() -> int:
     if len(sys.argv) > 1:
         choice = _resolve_choice(sys.argv[1])
         if not choice:
-            print("Uso: python3 start.py [install|tui|web]", file=sys.stderr)
+            program = _program_name()
+            print(f"Uso: {program} [install|tui|web]", file=sys.stderr)
             return 2
         _run_command(MENU_OPTIONS[choice][1])
         return 0
