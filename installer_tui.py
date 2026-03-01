@@ -18,12 +18,14 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 from panel_control.core import PanelManager
 from panel_control.services import send_recovery_secret
+from panel_control.terminal import ensure_curses_terminal
 
 
 @dataclass
@@ -1229,7 +1231,11 @@ class InstallerTUI:
 
 def main() -> None:
     try:
+        ensure_curses_terminal("El instalador TUI")
         curses.wrapper(lambda scr: InstallerTUI(scr).run())
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1)
     except KeyboardInterrupt:
         pass
 

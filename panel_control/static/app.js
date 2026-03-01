@@ -1,6 +1,8 @@
 const state = {
   token: localStorage.getItem("nicepanel_token") || "",
   user: null,
+  bootstrapConfigured: true,
+  recoveryVisible: false,
   domains: [],
   dns: [],
   ftp: [],
@@ -15,6 +17,8 @@ const loginView = document.querySelector("#login-view");
 const appView = document.querySelector("#app-view");
 const loginForm = document.querySelector("#login-form");
 const loginError = document.querySelector("#login-error");
+const setupForm = document.querySelector("#setup-form");
+const setupMessage = document.querySelector("#setup-message");
 const recoveryForm = document.querySelector("#recovery-form");
 const recoveryMessage = document.querySelector("#recovery-message");
 const globalMessage = document.querySelector("#global-message");
@@ -112,13 +116,57 @@ function switchView(loggedIn) {
   appView.hidden = !loggedIn;
 }
 
+function updateAuthForms() {
+  loginForm.hidden = !state.bootstrapConfigured || state.recoveryVisible;
+  recoveryForm.hidden = !state.bootstrapConfigured || !state.recoveryVisible;
+  setupForm.hidden = state.bootstrapConfigured;
+  document.querySelector("#show-recovery").hidden = !state.bootstrapConfigured;
+}
+
 function showRecoveryForm(visible) {
-  recoveryForm.hidden = !visible;
-  loginForm.hidden = visible;
+  state.recoveryVisible = visible && state.bootstrapConfigured;
+  updateAuthForms();
   if (!visible) {
     recoveryForm.reset();
     recoveryMessage.hidden = true;
   }
+}
+
+function describeError(error) {
+  const code = error instanceof Error ? error.message : String(error || "");
+  const messages = {
+    already_configured: "El panel web ya fue configurado.",
+    bootstrap_required: "Primero crea el acceso inicial del panel.",
+    invalid_credentials: "Usuario o password incorrectos.",
+    invalid_json: "La solicitud enviada es invalida.",
+    password_too_short: "La password debe tener al menos 8 caracteres.",
+    password_mismatch: "Las passwords no coinciden.",
+    username_required: "El usuario es obligatorio.",
+    unauthorized: "Sesion invalida o expirada.",
+    invalid_recovery_request: "Los datos de recuperacion no coinciden.",
+    recovery_rate_limited: "Demasiados intentos de recuperacion. Espera un rato.",
+    password_change_required: "Debes cambiar la password temporal antes de continuar.",
+  };
+  return messages[code] || code || "Error inesperado.";
+}
+
+async function fetchBootstrapState() {
+  const response = await fetch("/api/bootstrap");
+  let payload = {};
+  try {
+    payload = await response.json();
+  } catch (error) {
+    payload = {};
+  }
+  if (!response.ok || payload.ok === false) {
+    throw new Error(payload.error || "bootstrap_unavailable");
+  }
+  state.bootstrapConfigured = Boolean(payload.configured);
+  state.recoveryVisible = false;
+  document.querySelector("#login-username").value = payload.default_username || "admin";
+  document.querySelector("#recovery-username").value = payload.default_username || "admin";
+  document.querySelector("#setup-username").value = payload.default_username || "admin";
+  updateAuthForms();
 }
 
 function showForcePassword(required) {
@@ -424,6 +472,27 @@ async function login(username, password) {
   }
 }
 
+async function bootstrap(username, password, confirmPassword) {
+  const payload = await apiFetch("/api/bootstrap", {
+    method: "POST",
+    body: JSON.stringify({ username, password, confirm_password: confirmPassword }),
+  });
+  state.bootstrapConfigured = true;
+  state.recoveryVisible = false;
+  updateAuthForms();
+  setToken(payload.token);
+  try {
+    await loadAll();
+    setupForm.reset();
+    showRecoveryForm(false);
+    switchView(true);
+  } catch (error) {
+    setToken("");
+    switchView(false);
+    throw error;
+  }
+}
+
 async function logout(callApi = true) {
   try {
     if (callApi && state.token) {
@@ -443,6 +512,7 @@ async function logout(callApi = true) {
   state.mailOpsLogs = ["Sin ejecucion aun."];
   sessionUser.textContent = "";
   loginForm.reset();
+  setupForm.reset();
   showRecoveryForm(false);
   resetDomainForm();
   resetDnsForm();
@@ -469,8 +539,23 @@ loginForm.addEventListener("submit", async (event) => {
       document.querySelector("#login-password").value
     );
   } catch (error) {
-    loginError.textContent = error.message;
+    loginError.textContent = describeError(error);
     loginError.hidden = false;
+  }
+});
+
+setupForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  setupMessage.hidden = true;
+  try {
+    await bootstrap(
+      document.querySelector("#setup-username").value.trim(),
+      document.querySelector("#setup-password").value,
+      document.querySelector("#setup-password-confirm").value
+    );
+  } catch (error) {
+    setupMessage.textContent = describeError(error);
+    setupMessage.hidden = false;
   }
 });
 
@@ -498,7 +583,7 @@ recoveryForm.addEventListener("submit", async (event) => {
     recoveryMessage.className = "global-message success";
     recoveryMessage.hidden = false;
   } catch (error) {
-    recoveryMessage.textContent = error.message;
+    recoveryMessage.textContent = describeError(error);
     recoveryMessage.className = "form-error";
     recoveryMessage.hidden = false;
   }
@@ -696,7 +781,7 @@ forcePasswordForm.addEventListener("submit", async (event) => {
     await loadAll();
     showGlobalMessage("Password actualizada.");
   } catch (error) {
-    forcePasswordMessage.textContent = error.message;
+    forcePasswordMessage.textContent = describeError(error);
     forcePasswordMessage.hidden = false;
   }
 });
@@ -821,12 +906,13 @@ document.addEventListener("click", async (event) => {
 });
 
 (async function init() {
-  if (!state.token) {
-    activateTab("domains");
-    switchView(false);
-    return;
-  }
+  activateTab("domains");
   try {
+    await fetchBootstrapState();
+    if (!state.token) {
+      switchView(false);
+      return;
+    }
     await loadAll();
     switchView(true);
   } catch (error) {

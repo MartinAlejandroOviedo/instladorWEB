@@ -31,6 +31,25 @@
         <button id="show-recovery" type="button" class="button ghost">Recuperar acceso</button>
         <p id="login-error" class="form-error" hidden></p>
       </form>
+      <form id="setup-form" class="card form-card" hidden>
+        <p class="eyebrow">Primera ejecucion</p>
+        <h2>Crear acceso inicial</h2>
+        <p class="lede compact">La web todavia no tiene usuario configurado. Crea el acceso admin para empezar.</p>
+        <label>
+          <span>Usuario admin</span>
+          <input id="setup-username" autocomplete="username" value="admin" required>
+        </label>
+        <label>
+          <span>Password admin</span>
+          <input id="setup-password" type="password" autocomplete="new-password" required>
+        </label>
+        <label>
+          <span>Repetir password</span>
+          <input id="setup-password-confirm" type="password" autocomplete="new-password" required>
+        </label>
+        <button type="submit" class="button primary">Crear acceso</button>
+        <p id="setup-message" class="form-error" hidden></p>
+      </form>
       <form id="recovery-form" class="card form-card" hidden>
         <label>
           <span>Usuario</span>

@@ -30,6 +30,7 @@ from .services import (
     set_apache_site,
     web_update_preflight,
 )
+from .terminal import ensure_curses_terminal
 from .validators import (
     is_valid_domain,
     is_valid_email,
@@ -1060,4 +1061,5 @@ class ControlPanelTUI:
 
 
 def run_control_panel() -> None:
+    ensure_curses_terminal("El Panel TUI")
     curses.wrapper(lambda scr: ControlPanelTUI(scr).run())

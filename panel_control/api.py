@@ -67,6 +67,29 @@ class PanelAPI:
         self.manager = PanelManager(store or PanelStore())
         self.store = self.manager.store
 
+    def bootstrap_state(self) -> dict[str, Any]:
+        configured = self.manager.has_panel_credentials()
+        return {
+            "configured": configured,
+            "default_username": self.manager.get_panel_username("admin") if configured else "admin",
+        }
+
+    def bootstrap(self, username: str, password: str, confirm_password: str) -> dict[str, Any]:
+        if self.manager.has_panel_credentials():
+            raise ValueError("already_configured")
+        if not username:
+            raise ValueError("username_required")
+        if len(password) < 8:
+            raise ValueError("password_too_short")
+        if password != confirm_password:
+            raise ValueError("password_mismatch")
+        self.manager.set_panel_credentials(username, password)
+        return {
+            "token": self.issue_token(username),
+            "user": {"username": username, "role": self.manager.get_panel_role()},
+            "force_password_change": False,
+        }
+
     def _get_api_secret(self) -> str:
         secret = self.store.get_secret_setting("api_secret")
         if secret:
@@ -223,6 +246,9 @@ class PanelAPIHandler(BaseHTTPRequestHandler):
         if path == "/api/health":
             self._send_json(HTTPStatus.OK, {"ok": True, "service": "panel-api"})
             return
+        if path == "/api/bootstrap":
+            self._send_json(HTTPStatus.OK, {"ok": True, **self.api.bootstrap_state()})
+            return
 
         auth = self._require_auth()
         if auth is None:
@@ -294,6 +320,9 @@ class PanelAPIHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/login":
+            if not self.api.manager.has_panel_credentials():
+                self._send_json(HTTPStatus.CONFLICT, {"ok": False, "error": "bootstrap_required"})
+                return
             username = str(payload.get("username", "")).strip()
             password = str(payload.get("password", ""))
             result = self.api.authenticate(username, password)
@@ -308,6 +337,28 @@ class PanelAPIHandler(BaseHTTPRequestHandler):
                     "user": result["user"],
                     "force_password_change": result["force_password_change"],
                     "expires_in": TOKEN_TTL_SECONDS,
+                },
+            )
+            return
+
+        if path == "/api/bootstrap":
+            username = str(payload.get("username", "")).strip()
+            password = str(payload.get("password", ""))
+            confirm_password = str(payload.get("confirm_password", ""))
+            try:
+                result = self.api.bootstrap(username, password, confirm_password)
+            except ValueError as exc:
+                status = HTTPStatus.CONFLICT if str(exc) == "already_configured" else HTTPStatus.BAD_REQUEST
+                self._send_json(status, {"ok": False, "error": str(exc)})
+                return
+            self._send_json(
+                HTTPStatus.CREATED,
+                {
+                    "ok": True,
+                    "token": result["token"],
+                    "user": result["user"],
+                    "force_password_change": result["force_password_change"],
+                    "configured": True,
                 },
             )
             return
