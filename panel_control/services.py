@@ -57,6 +57,7 @@ class APIProxyConfig:
     api_host: str = "127.0.0.1"
     api_port: int = 8088
     public_path: str = "/api/"
+    enable_basic_auth: bool = False
     auth_user: str = "nicepanel"
     auth_password: str = ""
     service_name: str = "nicepanel-api"
@@ -397,7 +398,7 @@ def setup_api_proxy(config: APIProxyConfig) -> OptimizationResult:
     logs: List[str] = []
     if not config.server_name.strip():
         return OptimizationResult(False, ["[API] falta server_name"])
-    if not config.auth_password.strip():
+    if config.enable_basic_auth and not config.auth_password.strip():
         return OptimizationResult(False, ["[API] falta auth_password"])
 
     service_path = f"/etc/systemd/system/{config.service_name}.service"
@@ -430,23 +431,37 @@ WantedBy=multi-user.target
         return OptimizationResult(False, [f"[API] no se pudo escribir {service_path}: {err}"])
     logs.append(f"[API] service escrita: {service_path}")
 
-    rc, _, err = _run(["mkdir", "-p", "/etc/panelctl"])
-    if rc != 0:
-        return OptimizationResult(False, logs + [f"[API] no se pudo crear /etc/panelctl: {err}"])
+    auth_block = ""
+    apache_modules = "proxy proxy_http headers"
+    if config.enable_basic_auth:
+        rc, _, err = _run(["mkdir", "-p", "/etc/panelctl"])
+        if rc != 0:
+            return OptimizationResult(False, logs + [f"[API] no se pudo crear /etc/panelctl: {err}"])
 
-    htpasswd_hash = subprocess.run(
-        ["openssl", "passwd", "-apr1", config.auth_password],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if htpasswd_hash.returncode != 0:
-        return OptimizationResult(False, logs + [f"[API] no se pudo generar hash htpasswd: {htpasswd_hash.stderr.strip()}"])
-    auth_body = f"{config.auth_user}:{htpasswd_hash.stdout.strip()}\n"
-    rc, _, err = _run(["bash", "-lc", f"cat > {shlex.quote(auth_path)} <<'EOF'\n{auth_body}EOF"])
-    if rc != 0:
-        return OptimizationResult(False, logs + [f"[API] no se pudo escribir {auth_path}: {err}"])
-    logs.append(f"[API] auth file escrita: {auth_path}")
+        htpasswd_hash = subprocess.run(
+            ["openssl", "passwd", "-apr1", config.auth_password],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if htpasswd_hash.returncode != 0:
+            return OptimizationResult(False, logs + [f"[API] no se pudo generar hash htpasswd: {htpasswd_hash.stderr.strip()}"])
+        auth_body = f"{config.auth_user}:{htpasswd_hash.stdout.strip()}\n"
+        rc, _, err = _run(["bash", "-lc", f"cat > {shlex.quote(auth_path)} <<'EOF'\n{auth_body}EOF"])
+        if rc != 0:
+            return OptimizationResult(False, logs + [f"[API] no se pudo escribir {auth_path}: {err}"])
+        logs.append(f"[API] auth file escrita: {auth_path}")
+        auth_block = f"""
+
+    <Location />
+        AuthType Basic
+        AuthName "NicePanel"
+        AuthUserFile {auth_path}
+        Require valid-user
+    </Location>"""
+        apache_modules += " auth_basic authn_file"
+    else:
+        logs.append("[API] Basic Auth Apache deshabilitada; se usa solo el login interno de NicePanel.")
 
     site_body = f"""
 <VirtualHost *:80>
@@ -454,13 +469,7 @@ WantedBy=multi-user.target
 
     ProxyPreserveHost On
     ProxyRequests Off
-
-    <Location />
-        AuthType Basic
-        AuthName "NicePanel"
-        AuthUserFile {auth_path}
-        Require valid-user
-    </Location>
+{auth_block}
 
     ProxyPass / http://{config.api_host}:{config.api_port}/
     ProxyPassReverse / http://{config.api_host}:{config.api_port}/
@@ -477,7 +486,7 @@ WantedBy=multi-user.target
         return OptimizationResult(False, logs + [f"[API] no se pudo escribir {site_path}: {err}"])
     logs.append(f"[API] site escrita: {site_path}")
 
-    rc, _, err = _run(["bash", "-lc", "a2enmod proxy proxy_http headers auth_basic authn_file"])
+    rc, _, err = _run(["bash", "-lc", f"a2enmod {apache_modules}"])
     if rc != 0:
         return OptimizationResult(False, logs + [f"[API] no se pudieron habilitar modulos Apache: {err}"])
     logs.append("[API] modulos Apache habilitados para reverse proxy")
@@ -506,9 +515,10 @@ WantedBy=multi-user.target
     logs.append("[API] apache2 recargado")
     logs.append(f"[API] Web UI activa en http://{config.server_name}/")
     logs.append(f"[API] API publica activa en http://{config.server_name}{public_path}")
-    logs.append(
-        f"[API] Nota: Basic Auth de Apache ({config.auth_user}) es independiente del usuario/password interno de NicePanel."
-    )
+    if config.enable_basic_auth:
+        logs.append(
+            f"[API] Nota: Basic Auth de Apache ({config.auth_user}) es independiente del usuario/password interno de NicePanel."
+        )
     return OptimizationResult(True, logs)
 
 
