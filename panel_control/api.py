@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import errno
 import hmac
 import json
 import mimetypes
@@ -743,7 +744,18 @@ class PanelAPIHandler(BaseHTTPRequestHandler):
 
 
 def run_api(host: str = DEFAULT_API_HOST, port: int = DEFAULT_API_PORT) -> None:
-    server = ThreadingHTTPServer((host, port), PanelAPIHandler)
+    try:
+        server = ThreadingHTTPServer((host, port), PanelAPIHandler)
+    except OSError as exc:
+        if exc.errno == errno.EADDRINUSE:
+            raise RuntimeError(
+                f"El Panel Web/API no pudo iniciar porque {host}:{port} ya esta en uso. "
+                f"Si NicePanel ya esta corriendo, abri http://{host}:{port}/ . "
+                f"Si no, revisa el proceso con: ss -ltnp | grep ':{port}'"
+            ) from exc
+        raise RuntimeError(
+            f"El Panel Web/API no pudo iniciar en {host}:{port}: {exc.strerror or exc}"
+        ) from exc
     server.api = PanelAPI()  # type: ignore[attr-defined]
     base_url = f"http://{host}:{port}"
     print(
