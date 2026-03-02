@@ -199,6 +199,12 @@
             <div class="card-head">
               <h2>Records cargados</h2>
             </div>
+            <div class="form-actions">
+              <button id="dns-import" class="button ghost" type="button">Importar BIND</button>
+              <button id="dns-preview" class="button ghost" type="button">Preview apply</button>
+              <button id="dns-apply" class="button primary" type="button">Aplicar DNS</button>
+            </div>
+            <pre id="dns-ops-log" class="ops-log">Sin ejecucion aun.</pre>
             <div class="table-wrap">
               <table>
                 <thead>
@@ -331,6 +337,48 @@
 
       <section id="tab-apache" class="tab-panel">
         <div class="panel-grid single">
+          <section class="card table-card">
+            <div class="card-head">
+              <h2>Sitios Apache detectados</h2>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Site</th>
+                    <th>Dominio</th>
+                    <th>Destino</th>
+                    <th>SSL</th>
+                    <th>Archivo</th>
+                    <th>Estado</th>
+                  </tr>
+                </thead>
+                <tbody id="apache-sites-table"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="card table-card">
+            <div class="card-head">
+              <h2>Servicios del servidor</h2>
+              <span class="pill muted">apache2, bind9, vsftpd, postfix, dovecot, nicepanel-api</span>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Servicio</th>
+                    <th>Estado</th>
+                    <th>Puertos</th>
+                    <th>Acciones</th>
+                  </tr>
+                </thead>
+                <tbody id="services-table"></tbody>
+              </table>
+            </div>
+            <pre id="service-status-log" class="ops-log">Selecciona un servicio para ver status.</pre>
+          </section>
+
           <section class="card table-card">
             <div class="card-head">
               <h2>Modulos Apache</h2>

@@ -96,6 +96,15 @@ APACHE_COMMON_MODULES = [
     ("proxy_http", "reverse proxy HTTP"),
 ]
 
+MANAGED_SERVICES = [
+    {"service": "apache2", "label": "Apache", "ports": [80, 443]},
+    {"service": "bind9", "label": "DNS (bind9)", "ports": [53]},
+    {"service": "vsftpd", "label": "FTP (vsftpd)", "ports": [21]},
+    {"service": "postfix", "label": "SMTP (postfix)", "ports": [25, 587]},
+    {"service": "dovecot", "label": "IMAP/POP (dovecot)", "ports": [143, 993, 995]},
+    {"service": "nicepanel-api", "label": "NicePanel API", "ports": [8088]},
+]
+
 WHATSAPP_PROVIDER_ENV = "NICEPANEL_WHATSAPP_PROVIDER"
 TWILIO_ACCOUNT_SID_ENV = "NICEPANEL_TWILIO_ACCOUNT_SID"
 TWILIO_AUTH_TOKEN_ENV = "NICEPANEL_TWILIO_AUTH_TOKEN"
@@ -112,6 +121,14 @@ def _run(raw: List[str]) -> tuple[int, str, str]:
 def _command_exists(binary: str) -> bool:
     proc = subprocess.run(["bash", "-lc", f"command -v {binary} >/dev/null 2>&1"], check=False)
     return proc.returncode == 0
+
+
+def _read_text(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read()
+    except OSError:
+        return ""
 
 
 def _normalize_whatsapp_target(phone: str) -> str:
@@ -569,12 +586,126 @@ def _list_apache_entries(kind: str) -> List[dict[str, str | bool]]:
     return items
 
 
+def _extract_apache_site_details(path: str) -> dict[str, str | list[str] | bool]:
+    text = _read_text(path)
+    server_names = re.findall(r"^\s*ServerName\s+([^\s#]+)", text, flags=re.MULTILINE | re.IGNORECASE)
+    aliases = re.findall(r"^\s*ServerAlias\s+(.+)$", text, flags=re.MULTILINE | re.IGNORECASE)
+    document_roots = re.findall(r"^\s*DocumentRoot\s+([^\s#]+)", text, flags=re.MULTILINE | re.IGNORECASE)
+    proxy_pass = re.findall(r"^\s*ProxyPass\s+/+\s+([^\s#]+)", text, flags=re.MULTILINE | re.IGNORECASE)
+    return {
+        "server_name": server_names[0] if server_names else "",
+        "server_aliases": aliases[0].split() if aliases else [],
+        "document_root": document_roots[0] if document_roots else "",
+        "proxy_target": proxy_pass[0] if proxy_pass else "",
+        "https_declared": "<VirtualHost *:443>" in text or "SSLEngine on" in text,
+    }
+
+
 def list_apache_sites() -> List[dict[str, str | bool]]:
-    return _list_apache_entries("sites")
+    items = _list_apache_entries("sites")
+    for item in items:
+        name = str(item["name"])
+        path = os.path.join("/etc/apache2/sites-available", name)
+        details = _extract_apache_site_details(path)
+        item["file_path"] = path
+        item["server_name"] = details["server_name"]
+        item["server_aliases"] = details["server_aliases"]
+        item["document_root"] = details["document_root"]
+        item["proxy_target"] = details["proxy_target"]
+        item["https_declared"] = details["https_declared"]
+    return items
 
 
 def list_apache_confs() -> List[dict[str, str | bool]]:
     return _list_apache_entries("conf")
+
+
+def _systemctl_show(service: str) -> tuple[bool, dict[str, str]]:
+    rc, out, _ = _run(["systemctl", "show", service, "--property=LoadState,ActiveState,UnitFileState"])
+    if rc != 0:
+        return False, {}
+    values: dict[str, str] = {}
+    for line in out.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip()
+    return True, values
+
+
+def _listening_ports_snapshot() -> str:
+    rc, out, _ = _run(["ss", "-lntup"])
+    return out if rc == 0 else ""
+
+
+def list_managed_services() -> List[dict[str, str | bool | list[int]]]:
+    listening = _listening_ports_snapshot()
+    items: List[dict[str, str | bool | list[int]]] = []
+    for meta in MANAGED_SERVICES:
+        service = str(meta["service"])
+        exists, details = _systemctl_show(service)
+        ports = [int(port) for port in meta["ports"] if f":{port}" in listening]
+        active_state = details.get("ActiveState", "unknown")
+        unit_state = details.get("UnitFileState", "unknown")
+        items.append(
+            {
+                "service": service,
+                "label": str(meta["label"]),
+                "installed": exists and details.get("LoadState") != "not-found",
+                "active": active_state == "active",
+                "active_state": active_state,
+                "enabled": unit_state in {"enabled", "static", "generated", "indirect"},
+                "unit_file_state": unit_state,
+                "ports": ports,
+            }
+        )
+    return items
+
+
+def control_managed_service(service: str, action: str) -> OptimizationResult:
+    allowed_services = {str(item["service"]) for item in MANAGED_SERVICES}
+    allowed_actions = {"start", "stop", "restart", "reload"}
+    if service not in allowed_services:
+        return OptimizationResult(False, [f"[SERVICE] servicio no permitido: {service}"])
+    if action not in allowed_actions:
+        return OptimizationResult(False, [f"[SERVICE] accion no permitida: {action}"])
+    rc, out, err = _run(["systemctl", action, service])
+    if rc != 0:
+        return OptimizationResult(False, [f"[SERVICE] no se pudo {action} {service}: {err or out}"])
+    state = next((item for item in list_managed_services() if item["service"] == service), None)
+    summary = f"[SERVICE] {service} => {action} OK"
+    if state:
+        ports = ",".join(str(port) for port in state["ports"]) or "-"
+        summary += f" | estado: {state['active_state']} | puertos: {ports}"
+    return OptimizationResult(True, [summary])
+
+
+def get_managed_service_status(service: str) -> OptimizationResult:
+    allowed_services = {str(item["service"]) for item in MANAGED_SERVICES}
+    if service not in allowed_services:
+        return OptimizationResult(False, [f"[SERVICE] servicio no permitido: {service}"])
+    exists, details = _systemctl_show(service)
+    if not exists or details.get("LoadState") == "not-found":
+        return OptimizationResult(False, [f"[SERVICE] servicio no encontrado: {service}"])
+    logs: List[str] = [
+        f"[SERVICE] {service}",
+        f"  ActiveState: {details.get('ActiveState', 'unknown')}",
+        f"  UnitFileState: {details.get('UnitFileState', 'unknown')}",
+    ]
+    rc, out, err = _run(["systemctl", "status", service, "--no-pager", "--full"])
+    status_output = out or err
+    if status_output:
+        logs.append("")
+        logs.append("[systemctl status]")
+        logs.extend(status_output.splitlines()[:20])
+    if _command_exists("journalctl"):
+        rc, out, err = _run(["journalctl", "-u", service, "-n", "15", "--no-pager", "-o", "short-iso"])
+        journal_output = out or err
+        if journal_output:
+            logs.append("")
+            logs.append("[journalctl]")
+            logs.extend(journal_output.splitlines()[:15])
+    return OptimizationResult(rc in {0, 3}, logs)
 
 
 def _normalize_apache_entry(name: str) -> str:

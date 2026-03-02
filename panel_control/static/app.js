@@ -8,9 +8,13 @@ const state = {
   ftp: [],
   mail: [],
   modules: [],
+  apacheSites: [],
+  services: [],
   settings: null,
+  dnsOpsLogs: ["Sin ejecucion aun."],
   ftpOpsLogs: ["Sin ejecucion aun."],
   mailOpsLogs: ["Sin ejecucion aun."],
+  serviceStatusLogs: ["Selecciona un servicio para ver status."],
 };
 
 const loginView = document.querySelector("#login-view");
@@ -41,6 +45,8 @@ const rolePermissions = {
     "settings.write",
     "apache.read",
     "apache.write",
+    "services.read",
+    "services.write",
     "ops.preview",
     "ops.execute",
     "security.read",
@@ -56,6 +62,7 @@ const rolePermissions = {
     "settings.read",
     "settings.write",
     "apache.read",
+    "services.read",
     "ops.preview",
     "security.read",
     "web.read",
@@ -326,8 +333,12 @@ function renderMail() {
 }
 
 function renderOpsLogs() {
+  document.querySelector("#dns-ops-log").textContent = (state.dnsOpsLogs || ["Sin ejecucion aun."]).join("\n");
   document.querySelector("#ftp-ops-log").textContent = (state.ftpOpsLogs || ["Sin ejecucion aun."]).join("\n");
   document.querySelector("#mail-ops-log").textContent = (state.mailOpsLogs || ["Sin ejecucion aun."]).join("\n");
+  document.querySelector("#service-status-log").textContent = (
+    state.serviceStatusLogs || ["Selecciona un servicio para ver status."]
+  ).join("\n");
 }
 
 function renderModules() {
@@ -340,6 +351,48 @@ function renderModules() {
     tr.innerHTML = `
       <td>${item.module}</td>
       <td><span class="${enabled ? "state-on" : "state-off"}">${enabled ? "ON" : "OFF"}</span></td>
+    `;
+    body.appendChild(tr);
+  }
+}
+
+function renderApacheSites() {
+  const body = document.querySelector("#apache-sites-table");
+  body.innerHTML = "";
+  for (const item of state.apacheSites) {
+    const target = item.proxy_target || item.document_root || "-";
+    const aliases = (item.server_aliases || []).join(", ");
+    const filePath = item.file_path || "-";
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${item.name}</td>
+      <td>${item.server_name || "-"}${aliases ? `<br><small>${aliases}</small>` : ""}</td>
+      <td>${target}</td>
+      <td><span class="${item.https_declared ? "state-on" : "state-off"}">${item.https_declared ? "YES" : "NO"}</span></td>
+      <td><small>${filePath}</small></td>
+      <td><span class="${item.enabled ? "state-on" : "state-off"}">${item.enabled ? "ENABLED" : "DISABLED"}</span></td>
+    `;
+    body.appendChild(tr);
+  }
+}
+
+function renderServices() {
+  const body = document.querySelector("#services-table");
+  body.innerHTML = "";
+  for (const item of state.services) {
+    const ports = (item.ports || []).length ? item.ports.join(", ") : "-";
+    const canWrite = roleHas("services.write");
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${item.label}<br><small>${item.service}</small></td>
+      <td><span class="${item.active ? "state-on" : "state-off"}">${item.active ? "ACTIVE" : (item.active_state || "UNKNOWN").toUpperCase()}</span></td>
+      <td>${ports}</td>
+      <td>
+        <button class="button small ghost" data-action="service-status" data-service="${item.service}" type="button">Status</button>
+        <button class="button small ghost" data-action="service-start" data-service="${item.service}" type="button" ${canWrite ? "" : "disabled"}>Start</button>
+        <button class="button small ghost" data-action="service-stop" data-service="${item.service}" type="button" ${canWrite ? "" : "disabled"}>Stop</button>
+        <button class="button small primary" data-action="service-restart" data-service="${item.service}" type="button" ${canWrite ? "" : "disabled"}>Restart</button>
+      </td>
     `;
     body.appendChild(tr);
   }
@@ -379,6 +432,9 @@ function applyRoleVisibility() {
   const ftpApply = document.querySelector("#ftp-apply");
   const mailPreview = document.querySelector("#mail-preview");
   const mailApply = document.querySelector("#mail-apply");
+  const dnsImport = document.querySelector("#dns-import");
+  const dnsPreview = document.querySelector("#dns-preview");
+  const dnsApply = document.querySelector("#dns-apply");
 
   ftpTab.hidden = !roleHas("accounts.read");
   ftpPanel.hidden = !roleHas("accounts.read");
@@ -396,6 +452,9 @@ function applyRoleVisibility() {
   ftpApply.hidden = !roleHas("ops.execute");
   mailPreview.hidden = !roleHas("ops.preview");
   mailApply.hidden = !roleHas("ops.execute");
+  dnsImport.hidden = !roleHas("ops.execute");
+  dnsPreview.hidden = !roleHas("ops.preview");
+  dnsApply.hidden = !roleHas("ops.execute");
 
   settingsForm.querySelectorAll("input, button").forEach((element) => {
     element.disabled = !roleHas("settings.write");
@@ -421,18 +480,26 @@ async function loadAll() {
     state.ftp = [];
     state.mail = [];
     state.modules = [];
+    state.apacheSites = [];
+    state.services = [];
     state.settings = null;
+    state.dnsOpsLogs = ["Sin ejecucion aun."];
+    state.serviceStatusLogs = ["Selecciona un servicio para ver status."];
     showForcePassword(true);
     return;
   }
   const ftpRequest = roleHas("accounts.read") ? apiFetch("/api/ftp") : Promise.resolve({ items: [] });
   const mailRequest = roleHas("accounts.read") ? apiFetch("/api/mail") : Promise.resolve({ items: [] });
-  const [domains, dns, ftp, mail, modules, settings] = await Promise.all([
+  const apacheSitesRequest = roleHas("apache.read") ? apiFetch("/api/apache/sites") : Promise.resolve({ items: [] });
+  const servicesRequest = roleHas("services.read") ? apiFetch("/api/system/services") : Promise.resolve({ items: [] });
+  const [domains, dns, ftp, mail, modules, apacheSites, services, settings] = await Promise.all([
     apiFetch("/api/domains"),
     apiFetch("/api/dns"),
     ftpRequest,
     mailRequest,
     apiFetch("/api/apache/modules"),
+    apacheSitesRequest,
+    servicesRequest,
     apiFetch("/api/settings"),
   ]);
   state.domains = domains.items || [];
@@ -440,6 +507,8 @@ async function loadAll() {
   state.ftp = ftp.items || [];
   state.mail = mail.items || [];
   state.modules = modules.items || [];
+  state.apacheSites = apacheSites.items || [];
+  state.services = services.items || [];
   state.settings = settings.settings || null;
   applyRoleVisibility();
   showForcePassword(Boolean(state.user?.force_password_change));
@@ -449,6 +518,8 @@ async function loadAll() {
   renderFtp();
   renderMail();
   renderModules();
+  renderApacheSites();
+  renderServices();
   renderSettings();
   renderOpsLogs();
 }
@@ -507,9 +578,13 @@ async function logout(callApi = true) {
   state.ftp = [];
   state.mail = [];
   state.modules = [];
+  state.apacheSites = [];
+  state.services = [];
   state.settings = null;
+  state.dnsOpsLogs = ["Sin ejecucion aun."];
   state.ftpOpsLogs = ["Sin ejecucion aun."];
   state.mailOpsLogs = ["Sin ejecucion aun."];
+  state.serviceStatusLogs = ["Selecciona un servicio para ver status."];
   sessionUser.textContent = "";
   loginForm.reset();
   setupForm.reset();
@@ -607,6 +682,38 @@ document.querySelector("#ftp-username").addEventListener("input", syncFtpHomeDir
 document.querySelector("#ftp-domain").addEventListener("change", syncFtpHomeDir);
 document.querySelector("#ftp-home-dir").addEventListener("input", () => {
   document.querySelector("#ftp-home-dir").dataset.auto = "0";
+});
+document.querySelector("#dns-import").addEventListener("click", async () => {
+  try {
+    const payload = await apiFetch("/api/ops/import-bind", { method: "POST", body: JSON.stringify({ persist: true }) });
+    state.dnsOpsLogs = payload.logs || ["Importacion sin logs."];
+    await loadAll();
+    state.dnsOpsLogs = payload.logs || ["Importacion sin logs."];
+    renderOpsLogs();
+    showGlobalMessage("Zonas BIND importadas.");
+  } catch (error) {
+    showGlobalMessage(error.message, "error");
+  }
+});
+document.querySelector("#dns-preview").addEventListener("click", async () => {
+  try {
+    const payload = await apiFetch("/api/ops/dns/preview", { method: "POST", body: "{}" });
+    state.dnsOpsLogs = payload.logs || ["Sin preview."];
+    renderOpsLogs();
+    showGlobalMessage("Preview DNS actualizado.");
+  } catch (error) {
+    showGlobalMessage(error.message, "error");
+  }
+});
+document.querySelector("#dns-apply").addEventListener("click", async () => {
+  try {
+    const payload = await apiFetch("/api/ops/dns/apply", { method: "POST", body: "{}" });
+    state.dnsOpsLogs = payload.logs || ["Sin logs."];
+    renderOpsLogs();
+    showGlobalMessage("DNS aplicado.");
+  } catch (error) {
+    showGlobalMessage(error.message, "error");
+  }
 });
 document.querySelector("#ftp-preview").addEventListener("click", async () => {
   try {
@@ -899,6 +1006,36 @@ document.addEventListener("click", async (event) => {
       await apiFetch(`/api/mail/${itemId}`, { method: "DELETE" });
       await loadAll();
       showGlobalMessage("Cuenta mail eliminada.");
+    } catch (error) {
+      showGlobalMessage(error.message, "error");
+    }
+    return;
+  }
+  if (action === "service-status") {
+    const service = target.dataset.service || "";
+    try {
+      const payload = await apiFetch(`/api/system/services/${service}`);
+      state.serviceStatusLogs = payload.logs || [`Sin status para ${service}.`];
+      renderOpsLogs();
+      showGlobalMessage(`Status cargado para ${service}.`);
+    } catch (error) {
+      showGlobalMessage(error.message, "error");
+    }
+    return;
+  }
+  if (action === "service-start" || action === "service-stop" || action === "service-restart") {
+    const service = target.dataset.service || "";
+    const command = action.replace("service-", "");
+    try {
+      const payload = await apiFetch("/api/ops/system/service", {
+        method: "POST",
+        body: JSON.stringify({ service, action: command }),
+      });
+      state.serviceStatusLogs = payload.logs || [`Servicio ${service} actualizado.`];
+      await loadAll();
+      state.serviceStatusLogs = payload.logs || [`Servicio ${service} actualizado.`];
+      renderOpsLogs();
+      showGlobalMessage((payload.logs || [`Servicio ${service} actualizado.`]).join(" "));
     } catch (error) {
       showGlobalMessage(error.message, "error");
     }

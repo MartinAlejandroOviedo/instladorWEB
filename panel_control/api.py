@@ -28,9 +28,12 @@ from .services import (
     list_apache_confs,
     list_apache_modules,
     list_apache_sites,
+    list_managed_services,
     mail_apply_preview,
     optimization_preview,
     send_recovery_secret,
+    control_managed_service,
+    get_managed_service_status,
     set_apache_conf,
     set_apache_module,
     set_apache_site,
@@ -304,6 +307,22 @@ class PanelAPIHandler(BaseHTTPRequestHandler):
             if not self._require_permission(auth, "apache.read"):
                 return
             self._send_json(HTTPStatus.OK, {"ok": True, "items": list_apache_confs()})
+            return
+        if path == "/api/system/services":
+            if not self._require_permission(auth, "services.read"):
+                return
+            self._send_json(HTTPStatus.OK, {"ok": True, "items": list_managed_services()})
+            return
+        if path.startswith("/api/system/services/"):
+            if not self._require_permission(auth, "services.read"):
+                return
+            service = path.removeprefix("/api/system/services/").strip()
+            if not service:
+                self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
+                return
+            result = get_managed_service_status(service)
+            status = HTTPStatus.OK if result.ok else HTTPStatus.BAD_REQUEST
+            self._send_json(status, {"ok": result.ok, "logs": result.logs})
             return
         if path == "/api/settings":
             if not self._require_permission(auth, "settings.read"):
@@ -581,6 +600,18 @@ class PanelAPIHandler(BaseHTTPRequestHandler):
                     self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "missing_conf_name"})
                     return
                 result = set_apache_conf(conf, enabled)
+                status = HTTPStatus.OK if result.ok else HTTPStatus.BAD_REQUEST
+                self._send_json(status, {"ok": result.ok, "logs": result.logs})
+                return
+            if path == "/api/ops/system/service":
+                if not self._require_permission(auth, "services.write"):
+                    return
+                service = str(payload.get("service", "")).strip()
+                action = str(payload.get("action", "")).strip().lower()
+                if not service or not action:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "missing_service_action"})
+                    return
+                result = control_managed_service(service, action)
                 status = HTTPStatus.OK if result.ok else HTTPStatus.BAD_REQUEST
                 self._send_json(status, {"ok": result.ok, "logs": result.logs})
                 return
